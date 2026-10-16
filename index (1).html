@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Yaypan Muzqaymoq - Buyurtma berish</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Poppins', sans-serif; }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+
+    <!-- Header -->
+    <header class="bg-blue-600 text-white shadow-md sticky top-0 z-50">
+        <div class="container mx-auto px-4 py-4 flex justify-between items-center">
+            <h1 class="text-xl font-bold flex items-center gap-2">
+                🍦 Yaypan Muzqaymoq
+            </h1>
+            <button onclick="toggleCart()" class="bg-white text-blue-600 font-semibold px-4 py-2 rounded-full shadow hover:bg-blue-50 transition flex items-center gap-2">
+                🛒 Savat <span id="cart-count" class="bg-blue-600 text-white text-xs px-2 py-0.5 rounded-full">0</span>
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="container mx-auto px-4 py-8">
+        <!-- Customer Info Form -->
+        <section class="bg-white rounded-2xl shadow-sm p-6 mb-8 max-w-2xl mx-auto border border-gray-100">
+            <h2 class="text-lg font-bold mb-4 text-blue-600 flex items-center gap-2">👤 Ma'lumotlaringizni kiriting</h2>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Ism va Familiya</label>
+                    <input type="text" id="client-name" placeholder="Masalan: Alisher Valiyev" class="w-full px-4 py-2 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Yetkazib berish manzili</label>
+                    <input type="text" id="client-location" placeholder="Masalan: Yaypan shahri, Markaz ko'chasi" class="w-full px-4 py-2 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Telefon raqam</label>
+                    <input type="tel" id="client-phone" placeholder="+998 90 123 45 67" class="w-full px-4 py-2 border rounded-xl focus:ring-2 focus:ring-blue-500 outline-none">
+                </div>
+            </div>
+        </section>
+
+        <!-- Product Catalog -->
+        <h2 class="text-2xl font-bold mb-6 text-center">Mahsulotlar katalogi</h2>
+        <div id="products-grid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6"></div>
+    </main>
+
+    <!-- Cart Modal -->
+    <div id="cart-modal" class="fixed inset-0 bg-black bg-opacity-50 z-50 hidden flex justify-end">
+        <div class="bg-white w-full max-w-md h-full shadow-xl flex flex-col p-6 overflow-y-auto">
+            <div class="flex justify-between items-center mb-6 border-b pb-4">
+                <h3 class="text-xl font-bold">🛒 Sizning savatingiz</h3>
+                <button onclick="toggleCart()" class="text-gray-500 hover:text-gray-700 text-xl font-bold">&times;</button>
+            </div>
+            
+            <div id="cart-items" class="flex-grow space-y-4 overflow-y-auto"></div>
+
+            <div class="border-t pt-4 mt-4">
+                <div class="flex justify-between text-lg font-bold mb-4">
+                    <span>Umumiy summa:</span>
+                    <span id="cart-total" class="text-blue-600">0 so'm</span>
+                </div>
+                <button onclick="checkout()" class="w-full bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition shadow-lg">
+                    ✅ Buyurtmani yakunlash
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript Logic -->
+    <script>
+        const BOT_TOKEN = "8941827736:AAHOhxklEGG1tbw0Zn6mDyBadAdqeZOdxlw";
+        const ADMIN_ID = "8488328091";
+
+        const PRODUCTS = {
+            "oilaviy": {"name": "1. Oilaviy (0.5 kg karobka)", "count_in_box": 12, "price": 15000, "photo": "https://i.postimg.cc/GtzstjbM/photo-2026-09-21-07-21-08.jpg"},
+            "zuxro_shoko": {"name": "2. Zuxro shokolad", "count_in_box": 24, "price": 4000, "photo": "https://i.postimg.cc/mDS1L4L4/photo-2026-09-21-15-11-38.jpg"},
+            "flash": {"name": "3. Flash", "count_in_box": 50, "price": 800, "photo": "https://i.postimg.cc/sgZBB7ff/photo-2026-09-21-15-11-44.jpg"},
+            "moxitto": {"name": "4. Moxitto", "count_in_box": 50, "price": 800, "photo": "https://i.postimg.cc/8ktfxTnD/photo-2026-09-21-15-11-48.jpg"},
+            "sutli": {"name": "5. Sutli", "count_in_box": 54, "price": 1600, "photo": "https://i.postimg.cc/TPVp0xWq/photo-2026-09-21-15-11-53.jpg"},
+            "ananas": {"name": "6. Ananas", "count_in_box": 50, "price": 800, "photo": "https://i.postimg.cc/MGSGvLrB/photo-2026-09-21-17-23-00.jpg"},
+            "anor": {"name": "7. Anor", "count_in_box": 50, "price": 800, "photo": "https://i.postimg.cc/v8NHWTNw/photo-2026-09-21-17-27-44.jpg"},
+            "jazzi": {"name": "8. Jazzi", "count_in_box": 50, "price": 2300, "photo": "https://i.postimg.cc/rw99d1ZS/photo-2026-09-21-15-10-03.jpg"},
+            "ferero": {"name": "9. Ferero", "count_in_box": 54, "price": 2200, "photo": "https://i.postimg.cc/3J1ymt7w/photo-2026-09-21-15-10-17.jpg"},
+            "anjan_qulupnay": {"name": "10. Anjan qulupnay", "count_in_box": 20, "price": 5000, "photo": "https://i.postimg.cc/tT6Z6yC7/photo-2026-09-21-15-10-13.jpg"},
+            "shokoland": {"name": "11. Shokoland", "count_in_box": 60, "price": 1600, "photo": "https://i.postimg.cc/RVBfc3HY/photo-2026-09-21-15-10-07.jpg"},
+            "ayron": {"name": "12. Ayron", "count_in_box": 70, "price": 800, "photo": "https://i.postimg.cc/fyTsNjP1/photo-2026-09-21-15-10-25.jpg"},
+            "pankie": {"name": "13. Pankie", "count_in_box": 24, "price": 6000, "photo": "https://i.postimg.cc/7ZTkwLB0/photo-2026-09-21-15-10-31.jpg"},
+            "labubu": {"name": "14. Labubu", "count_in_box": 24, "price": 8000, "photo": "https://i.postimg.cc/SQTF993S/photo-2026-09-21-15-10-37.jpg"},
+            "gold": {"name": "15. Gold", "count_in_box": 28, "price": 5000, "photo": "https://i.postimg.cc/8P92KS1c/photo-2026-09-21-15-10-42.jpg"},
+            "rojok": {"name": "16. Rojok", "count_in_box": 30, "price": 1600, "photo": "https://i.postimg.cc/C1ctjyPx/photo-2026-09-21-15-10-46.jpg"},
+            "sendwich": {"name": "17. Sendwich", "count_in_box": 24, "price": 5000, "photo": "https://i.postimg.cc/05HFjsKb/photo-2026-09-21-15-10-50.jpg"},
+            "gazeta": {"name": "18. Gazeta", "count_in_box": 20, "price": 3500, "photo": "https://i.postimg.cc/pdx14V3L/photo-2026-09-21-15-10-55.jpg"},
+            "stakan": {"name": "19. Stakan", "count_in_box": 48, "price": 1600, "photo": "https://i.postimg.cc/63QtZxVC/photo-2026-09-21-15-11-09.jpg"},
+            "anjan": {"name": "20. Anjan", "count_in_box": 20, "price": 5000, "photo": "https://i.postimg.cc/rFfGG1LV/photo-2026-09-21-15-11-14.jpg"},
+            "banan": {"name": "21. Banan", "count_in_box": 48, "price": 1600, "photo": "https://i.postimg.cc/bYT18xr6/photo-2026-09-21-15-11-29.jpg"}
+        };
+
+        let cart = {};
+
+        function renderProducts() {
+            const grid = document.getElementById('products-grid');
+            grid.innerHTML = '';
+            for (let key in PRODUCTS) {
+                let prod = PRODUCTS[key];
+                let boxTotal = prod.count_in_box * prod.price;
+                grid.innerHTML += `
+                    <div class="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden flex flex-col justify-between">
+                        <div>
+                            <div class="relative h-48 bg-gray-100 flex items-center justify-center overflow-hidden">
+                                <img src="${prod.photo}" alt="${prod.name}" class="w-full h-full object-cover cursor-pointer hover:scale-105 transition duration-300" onclick="window.open('${prod.photo}', '_blank')" title="Rasmni to'liq ko'rish uchun bosing" onerror="this.onerror=null; this.src='https://images.unsplash.com/photo-1560008511-11c63416e52d?auto=format&fit=crop&w=500&q=80';">
+                                <span class="absolute top-3 left-3 bg-black bg-opacity-60 text-white text-xs px-2.5 py-1 rounded-full font-medium pointer-events-none">📦 Qutida: ${prod.count_in_box} ta</span>
+                            </div>
+                            <div class="p-4">
+                                <h3 class="font-bold text-lg mb-2">${prod.name}</h3>
+                                <p class="text-sm text-gray-600">Dona narxi: <span class="font-semibold text-gray-800">${prod.price.toLocaleString()} so'm</span></p>
+                                <p class="text-sm text-gray-600">Jami quti: <span class="font-semibold text-blue-600">${boxTotal.toLocaleString()} so'm</span></p>
+                            </div>
+                        </div>
+                        <div class="p-4 pt-0 grid grid-cols-2 gap-2">
+                            <button onclick="addBox('${key}')" class="bg-blue-50 text-blue-600 text-xs font-bold py-2.5 px-2 rounded-xl hover:bg-blue-100 transition">📦 Karobka</button>
+                            <button onclick="addCustom('${key}')" class="bg-blue-600 text-white text-xs font-bold py-2.5 px-2 rounded-xl hover:bg-blue-700 transition">🔢 Dona</button>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        function addBox(key) {
+            let prod = PRODUCTS[key];
+            let count = prod.count_in_box;
+            cart[key] = (cart[key] || 0) + count;
+            updateCartUI();
+            alert(`1 karobka (${count} ta) savatga qo'shildi! ✅`);
+        }
+
+        function addCustom(key) {
+            let prod = PRODUCTS[key];
+            let input = prompt(`${prod.name} uchun nechta dona olishni xohlaysiz?`, "10");
+            if (input && !isNaN(input) && parseInt(input) > 0) {
+                let count = parseInt(input);
+                cart[key] = (cart[key] || 0) + count;
+                updateCartUI();
+                alert(`${count} dona savatga qo'shildi! ✅`);
+            }
+        }
+
+        function updateCartUI() {
+            let totalItems = 0;
+            let totalPrice = 0;
+            let cartContainer = document.getElementById('cart-items');
+            cartContainer.innerHTML = '';
+
+            for (let key in cart) {
+                let qty = cart[key];
+                let prod = PRODUCTS[key];
+                let cost = qty * prod.price;
+                totalItems += qty;
+                totalPrice += cost;
+
+                cartContainer.innerHTML += `
+                    <div class="flex justify-between items-center border-b pb-3">
+                        <div>
+                            <h4 class="font-semibold text-sm">${prod.name}</h4>
+                            <p class="text-xs text-gray-500">${qty} ta × ${prod.price.toLocaleString()} = ${cost.toLocaleString()} so'm</p>
+                        </div>
+                        <button onclick="removeItem('${key}')" class="text-red-500 hover:text-red-700 text-sm font-bold">❌</button>
+                    </div>
+                `;
+            }
+
+            document.getElementById('cart-count').innerText = totalItems;
+            document.getElementById('cart-total').innerText = totalPrice.toLocaleString() + " so'm";
+        }
+
+        function removeItem(key) {
+            delete cart[key];
+            updateCartUI();
+        }
+
+        function toggleCart() {
+            let modal = document.getElementById('cart-modal');
+            modal.classList.toggle('hidden');
+        }
+
+        async function checkout() {
+            let name = document.getElementById('client-name').value.trim();
+            let location = document.getElementById('client-location').value.trim();
+            let phone = document.getElementById('client-phone').value.trim();
+
+            if (!name || !location || !phone) {
+                alert("Iltimos, avval ism, manzil va telefon raqamingizni kiriting!");
+                toggleCart();
+                return;
+            }
+
+            if (Object.keys(cart).length === 0) {
+                alert("Savatingiz bo'sh!");
+                return;
+            }
+
+            let orderDetails = "";
+            let totalPrice = 0;
+
+            for (let key in cart) {
+                let qty = cart[key];
+                let prod = PRODUCTS[key];
+                let cost = qty * prod.price;
+                totalPrice += cost;
+                orderDetails += `• ${prod.name}: ${qty} ta × ${prod.price} = ${cost} so'm\n`;
+            }
+
+            let message = `📥 *Veb-saytdan yangi buyurtma!*\n\n` +
+                          `👤 *Ism:* ${name}\n` +
+                          `📍 *Manzil:* ${location}\n` +
+                          `📞 *Telefon:* ${phone}\n\n` +
+                          `🛍 *Buyurtma tarkibi:*\n${orderDetails}\n` +
+                          `💳 *Umumiy summa:* ${totalPrice.toLocaleString()} so'm`;
+
+            try {
+                let response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        chat_id: ADMIN_ID,
+                        text: message,
+                        parse_mode: 'Markdown'
+                    })
+                });
+
+                if (response.ok) {
+                    alert("Buyurtmangiz muvaffaqiyatli yuborildi! ✅ Tez orada siz bilan bog'lanishadi.");
+                    cart = {};
+                    updateCartUI();
+                    toggleCart();
+                } else {
+                    alert("Buyurtmani yuborishda xatolik yuz berdi. Qaytdan urinib ko'ring.");
+                }
+            } catch (error) {
+                alert("Tarmoqda xatolik yuz berdi.");
+            }
+        }
+
+        renderProducts();
+    </script>
+</body>
+</html>
