@@ -20,12 +20,17 @@ from aiogram.types import (
     WebAppInfo, BotCommand, MenuButtonCommands, BufferedInputFile,
 )
 
-TOKEN = os.environ.get("BOT_TOKEN", "8941827736:AAHo3ZOI00lpKHO4gZBqONCjvTAzxO9cE24")
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable o'rnatilmagan! Render > Environment bo'limiga qo'shing.")
 ADMIN_ID = 8488328091
 WEBAPP_URL = "https://yaypanmuzqamoq.netlify.app/"
-USERS_FILE = "users.json"
-DEBTS_FILE = "debts.json"    # База долгов
-ORDERS_FILE = "orders.json"  # База заказов
+# Agar Render'da Persistent Disk ulasangiz, DATA_DIR=/data qilib qo'ying
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+DEBTS_FILE = os.path.join(DATA_DIR, "debts.json")    # База долгов
+ORDERS_FILE = os.path.join(DATA_DIR, "orders.json")  # База заказов
 CHANNEL = "@YAYPAN_muzqaymoq"
 CHANNEL_URL = "https://t.me/YAYPAN_muzqaymoq"
 
@@ -62,6 +67,7 @@ PRODUCTS = {
 class OrderState(StatesGroup):
     waiting_for_name = State()
     waiting_for_location = State()
+    waiting_for_geo = State()
     waiting_for_phone = State()
     waiting_for_save = State()
     shopping = State()
@@ -86,6 +92,7 @@ def save_json(filepath, data):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logging.error(f"Ошибка записи в {filepath}: {e}")
+    request_backup()
 
 saved_users = load_json(USERS_FILE)
 debts_db = load_json(DEBTS_FILE)
@@ -93,11 +100,95 @@ orders_db = load_json(ORDERS_FILE)
 if not isinstance(orders_db, list):
     orders_db = []
 
+# ---------- Telegram orqali zaxira (Render restart bo'lganda ma'lumot yo'qolmasligi uchun) ----------
+# Render bepul tarifida fayllar har restartda o'chib ketadi. Shuning uchun har o'zgarishdan keyin
+# barcha ma'lumot bitta backup.json qilib adminga yuboriladi va PIN qilinadi.
+# Bot qayta ishga tushganda shu pin qilingan fayldan hammasi tiklanadi.
+_backup_scheduled = False
+_last_backup_msg_id = None
+
+def request_backup():
+    """Ma'lumot o'zgarganda chaqiriladi; 10 soniya ichidagi o'zgarishlarni bitta zaxiraga birlashtiradi."""
+    global _backup_scheduled
+    if _backup_scheduled:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _backup_scheduled = True
+    loop.create_task(_do_backup())
+
+def _backup_payload():
+    return json.dumps(
+        {"users": saved_users, "debts": debts_db, "orders": orders_db},
+        ensure_ascii=False, indent=1
+    ).encode("utf-8")
+
+async def _do_backup(delay=10):
+    global _backup_scheduled, _last_backup_msg_id
+    await asyncio.sleep(delay)
+    _backup_scheduled = False
+    try:
+        msg = await bot.send_document(
+            ADMIN_ID,
+            BufferedInputFile(_backup_payload(), filename="backup.json"),
+            caption="💾 Avtomatik zaxira (o'chirmang, bot shu fayldan tiklanadi)",
+            disable_notification=True,
+        )
+        await bot.pin_chat_message(ADMIN_ID, msg.message_id, disable_notification=True)
+        old_id, _last_backup_msg_id = _last_backup_msg_id, msg.message_id
+        if old_id:
+            try:
+                await bot.delete_message(ADMIN_ID, old_id)
+            except Exception:
+                pass
+    except Exception as e:
+        logging.error(f"Zaxira yuborilmadi: {e}")
+
+async def restore_from_telegram():
+    """Fayllar bo'sh bo'lsa (yangi restart), adminning pin qilingan backup.json faylidan tiklaydi."""
+    global _last_backup_msg_id
+    if saved_users or debts_db or orders_db:
+        return
+    try:
+        chat = await bot.get_chat(ADMIN_ID)
+        pm = chat.pinned_message
+        if not pm or not pm.document:
+            logging.info("Tiklash uchun zaxira topilmadi.")
+            return
+        f = await bot.get_file(pm.document.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(f.file_path, buf)
+        data = json.loads(buf.getvalue().decode("utf-8"))
+        saved_users.update(data.get("users", {}))
+        debts_db.update(data.get("debts", {}))
+        orders_db.extend(data.get("orders", []))
+        _last_backup_msg_id = pm.message_id
+        # Lokal fayllarga ham yozib qo'yamiz
+        for path, obj in ((USERS_FILE, saved_users), (DEBTS_FILE, debts_db), (ORDERS_FILE, orders_db)):
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(obj, fh, ensure_ascii=False, indent=2)
+        logging.info(f"Zaxiradan tiklandi: {len(saved_users)} mijoz, {len(debts_db)} qarzdor, {len(orders_db)} buyurtma")
+        await bot.send_message(
+            ADMIN_ID,
+            f"♻️ Bot qayta ishga tushdi, ma'lumotlar zaxiradan tiklandi:\n"
+            f"👥 Mijozlar: {len(saved_users)}\n💳 Qarzdorlar: {len(debts_db)}\n📥 Buyurtmalar: {len(orders_db)}"
+        )
+    except Exception as e:
+        logging.error(f"Tiklashda xato: {e}")
+
+def maps_link(geo):
+    return f"https://www.google.com/maps?q={geo['lat']},{geo['lon']}"
+
+def get_user_debt(user_id):
+    return int(debts_db.get(str(user_id), {}).get("debt", 0) or 0)
+
 def get_saved_user(user_id):
     return saved_users.get(str(user_id))
 
-def set_saved_user(user_id, name, location, phone):
-    saved_users[str(user_id)] = {"name": name, "location": location, "phone": phone}
+def set_saved_user(user_id, name, location, phone, geo=None):
+    saved_users[str(user_id)] = {"name": name, "location": location, "phone": phone, "geo": geo}
     save_json(USERS_FILE, saved_users)
 
 def delete_saved_user(user_id):
@@ -170,21 +261,41 @@ save_keyboard = InlineKeyboardMarkup(inline_keyboard=[
     ]
 ])
 
-def info_text(name, location, phone):
-    return (
+def info_text(name, location, phone, geo=None, debt=None):
+    t = (
         f"👤 <b>Ism:</b> {html.escape(str(name))}\n"
         f"📍 <b>Manzil:</b> {html.escape(str(location))}\n"
         f"📞 <b>Telefon:</b> {html.escape(str(phone))}"
     )
+    if geo:
+        t += f"\n🗺 <b>Lokatsiya:</b> <a href=\"{maps_link(geo)}\">Google Mapda ochish</a>"
+    if debt is not None:
+        t += f"\n💳 <b>Mijozning eski qarzi:</b> {int(debt):,} so'm"
+    return t
 
-def admin_order_keyboard(user_id, total_price):
-    return InlineKeyboardMarkup(inline_keyboard=[
+def admin_order_keyboard(user_id, total_price, geo=None):
+    rows = []
+    if geo:
+        rows.append([InlineKeyboardButton(text="🗺 Google Mapda ko'rish", url=maps_link(geo))])
+    return InlineKeyboardMarkup(inline_keyboard=rows + [
         [InlineKeyboardButton(text="🚚 Yetkazilmoqda", callback_data=f"deliv_{user_id}")],
         [InlineKeyboardButton(text="💵 Pulni oldim (Qarz yo'q)", callback_data=f"pay_full_{user_id}_{total_price}")],
         [InlineKeyboardButton(text="📝 To'liq qarzga berildi", callback_data=f"pay_debt_{user_id}_{total_price}")],
         [InlineKeyboardButton(text="⚡ Qisman to'landi", callback_data=f"pay_part_{user_id}_{total_price}")],
         [InlineKeyboardButton(text="🖨 Print qilish", callback_data="print_order")],
     ])
+
+async def send_admin_order(user_id, admin_message, total_price, geo=None):
+    await bot.send_message(
+        ADMIN_ID, admin_message, parse_mode="HTML",
+        reply_markup=admin_order_keyboard(user_id, total_price, geo),
+        disable_web_page_preview=True,
+    )
+    if geo:
+        try:
+            await bot.send_location(ADMIN_ID, geo["lat"], geo["lon"])
+        except Exception as e:
+            logging.warning(f"Lokatsiya yuborilmadi: {e}")
 
 def fmt_money(n):
     return f"{int(n):,}".replace(",", " ")
@@ -422,11 +533,11 @@ async def begin_flow(message: types.Message, state: FSMContext, user_id: int):
 
     saved = get_saved_user(user_id)
     if saved:
-        await state.update_data(name=saved["name"], location=saved["location"], phone=saved["phone"])
+        await state.update_data(name=saved["name"], location=saved["location"], phone=saved["phone"], geo=saved.get("geo"))
         await message.answer(
             f"Assalomu alaykum, <b>{html.escape(saved['name'])}</b>! 🍦\n"
             f"Buyurtma shu ma'lumotlar bilan yuboriladi:\n\n"
-            f"{info_text(saved['name'], saved['location'], saved['phone'])}\n\n"
+            f"{info_text(saved['name'], saved['location'], saved['phone'], saved.get('geo'))}\n\n"
             f"O'zgartirish uchun «✏️ Ma'lumotlarni o'zgartirish» tugmasini bosing.",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard
@@ -464,6 +575,30 @@ async def process_name(message: types.Message, state: FSMContext):
 @dp.message(OrderState.waiting_for_location)
 async def process_location(message: types.Message, state: FSMContext):
     await state.update_data(location=message.text)
+    geo_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📍 Lokatsiyamni yuborish", request_location=True)],
+            [KeyboardButton(text="⏭ O'tkazib yuborish")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer(
+        "Endi aniq qayerda ekaningizni ko'rsatish uchun 📍 lokatsiyangizni yuboring.\n"
+        "(Pastdagi tugmani bosing. Yetkazib berish uchun juda kerak!)",
+        reply_markup=geo_kb
+    )
+    await state.set_state(OrderState.waiting_for_geo)
+
+@dp.message(OrderState.waiting_for_geo)
+async def process_geo(message: types.Message, state: FSMContext):
+    if message.location:
+        await state.update_data(geo={"lat": message.location.latitude, "lon": message.location.longitude})
+    elif message.text and message.text.startswith("⏭"):
+        await state.update_data(geo=None)
+    else:
+        await message.answer("Iltimos, «📍 Lokatsiyamni yuborish» tugmasini bosing yoki «⏭ O'tkazib yuborish»ni tanlang.")
+        return
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📞 Telefon raqamni yuborish", request_contact=True)]],
         resize_keyboard=True,
@@ -480,10 +615,11 @@ async def process_phone(message: types.Message, state: FSMContext):
 
     await message.answer("Rahmat! ✅", reply_markup=types.ReplyKeyboardRemove())
     await message.answer(
-        f"{info_text(data.get('name'), data.get('location'), phone)}\n\n"
+        f"{info_text(data.get('name'), data.get('location'), phone, data.get('geo'))}\n\n"
         f"💾 Shu ma'lumotlar saqlansinmi?\n"
         f"Saqlansa, keyingi safar qayta so'ralmaydi va buyurtmalar doim shu nomdan boradi.",
         parse_mode="HTML",
+        disable_web_page_preview=True,
         reply_markup=save_keyboard
     )
     await state.set_state(OrderState.waiting_for_save)
@@ -494,7 +630,7 @@ async def process_save(callback_query: types.CallbackQuery, state: FSMContext):
     user_id = callback_query.from_user.id
 
     if callback_query.data == "save_yes":
-        set_saved_user(user_id, data.get("name"), data.get("location"), data.get("phone"))
+        set_saved_user(user_id, data.get("name"), data.get("location"), data.get("phone"), data.get("geo"))
         result = "💾 Ma'lumotlaringiz saqlandi!"
     else:
         result = "Ma'lumotlar saqlanmadi (faqat shu buyurtma uchun ishlatiladi)."
@@ -523,6 +659,12 @@ async def handle_web_app_data(message: types.Message):
     user_name = data_json.get("name") or user_saved_info.get("name") or message.from_user.full_name
     user_phone = data_json.get("phone") or user_saved_info.get("phone") or "-"
     user_loc = data_json.get("location") or user_saved_info.get("location") or "-"
+    geo = user_saved_info.get("geo")
+    try:
+        if data_json.get("lat") is not None and data_json.get("lon") is not None:
+            geo = {"lat": float(data_json["lat"]), "lon": float(data_json["lon"])}
+    except Exception:
+        pass
 
     items_list = data_json.get("items", [])
     total_price = 0
@@ -559,16 +701,11 @@ async def handle_web_app_data(message: types.Message):
 
     admin_message = (
         f"📥 <b>Yangi buyurtma keldi! (Mini App)</b>\n\n"
-        f"{info_text(user_name, user_loc, user_phone)}\n\n"
+        f"{info_text(user_name, user_loc, user_phone, geo, get_user_debt(user_id))}\n\n"
         f"🛍 <b>Buyurtma tarkibi:</b>\n{order_details}\n"
         f"💳 <b>Umumiy summa:</b> {total_price} so'm"
     )
-    await bot.send_message(
-        ADMIN_ID,
-        admin_message,
-        parse_mode="HTML",
-        reply_markup=admin_order_keyboard(user_id, total_price)
-    )
+    await send_admin_order(user_id, admin_message, total_price, geo)
 
     await message.answer(
         "Buyurtmangiz Mini App orqali muvaffaqiyatli qabul qilindi! ✅ Tez orada siz bilan bog'lanishadi.",
@@ -693,6 +830,7 @@ async def finish_order(message: types.Message, state: FSMContext):
     user_saved_info = saved_users.get(str(user_id)) or {}
     user_name = data.get('name') or user_saved_info.get('name') or "Noma’lum"
     user_phone = data.get('phone') or user_saved_info.get('phone') or "-"
+    geo = data.get('geo') or user_saved_info.get('geo')
 
     # Сохранение заказа для API
     new_order = {
@@ -708,11 +846,11 @@ async def finish_order(message: types.Message, state: FSMContext):
 
     admin_message = (
         f"📥 <b>Yangi buyurtma keldi! (bot)</b>\n\n"
-        f"{info_text(user_name, data.get('location', '-'), user_phone)}\n\n"
+        f"{info_text(user_name, data.get('location') or user_saved_info.get('location') or '-', user_phone, geo, get_user_debt(user_id))}\n\n"
         f"🛍 <b>Buyurtma tarkibi:</b>\n{order_details}\n"
         f"💳 <b>Umumiy summa:</b> {total_price} so'm"
     )
-    await bot.send_message(ADMIN_ID, admin_message, parse_mode="HTML", reply_markup=admin_order_keyboard(user_id, total_price))
+    await send_admin_order(user_id, admin_message, total_price, geo)
 
     user_carts[user_id] = {}
     await message.answer(
@@ -910,6 +1048,13 @@ async def process_partial_pay_input(message: types.Message, state: FSMContext):
     await message.answer(msg_text)
     await state.clear()
 
+@dp.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await _do_backup(delay=0)
+    await message.answer("✅ Zaxira yuborildi va pin qilindi.")
+
 # ---------- API (Для мобильного приложения) ----------
 async def get_orders_api(request):
     return web.json_response(orders_db)
@@ -952,6 +1097,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+    await restore_from_telegram()
     await setup_bot_menu()
     await dp.start_polling(bot)
 
