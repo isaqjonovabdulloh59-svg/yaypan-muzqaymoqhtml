@@ -1,0 +1,28 @@
+{
+    "UZBEKISTAN": {
+        "amount": 10000,
+        "uses": 4,
+        "activated_users": [
+            "8619554135"
+        ]
+    },
+    "BONUS2026": {
+        "amount": 5000,
+        "uses": 10,
+        "activated_users": []
+    },
+    "yaqnlarimuchun": {
+        "amount": 100000,
+        "uses": 7,
+        "activated_users": [
+            "8488328091",
+            "5987150969",
+            "61297819"
+        ]
+    },
+    "profilsoat_n1": {
+        "amount": 5000,
+        "uses": 20,
+        "activated_users": []
+    }
+}
