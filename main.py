@@ -20,7 +20,7 @@ from aiogram.types import (
     WebAppInfo, BotCommand, MenuButtonCommands, BufferedInputFile,
 )
 
-TOKEN = os.environ.get("BOT_TOKEN", "8941827736:AAHTSclOer3V_D2JdcIqMj3dOqfJqo_4jKY")
+TOKEN = os.environ.get("BOT_TOKEN", "8941827736:AAHo3ZOI00lpKHO4gZBqONCjvTAzxO9cE24")
 ADMIN_ID = 8488328091
 WEBAPP_URL = "https://yaypanmuzqamoq.netlify.app/"
 USERS_FILE = "users.json"
