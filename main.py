@@ -25,6 +25,8 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable o'rnatilmagan! Render > Environment bo'limiga qo'shing.")
 ADMIN_ID = 8488328091
 WEBAPP_URL = "https://yaypanmuzqamoq.netlify.app/"
+# Yaypan shahri markazi (mijozlarga xarita sifatida yuboriladi)
+YAYPAN_LAT, YAYPAN_LON = 40.37583, 70.81556
 # Agar Render'da Persistent Disk ulasangiz, DATA_DIR=/data qilib qo'ying
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -728,19 +730,32 @@ async def process_location(message: types.Message, state: FSMContext):
     await state.update_data(location=message.text)
     geo_kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="⏭ O'tkazib yuborish")]],
-        resize_keyboard=True,
-        one_time_keyboard=True
+        resize_keyboard=True
     )
+    try:
+        await bot.send_location(message.chat.id, YAYPAN_LAT, YAYPAN_LON)
+    except Exception as e:
+        logging.error(f"Yaypan lokatsiyasi yuborilmadi: {e}")
     await message.answer(
-        "📍 Do'koningiz joylashgan nuqtani xaritada o'zingiz belgilang:\n\n"
-        "1️⃣ Chatdagi 📎 (skrepka) tugmasini bosing\n"
+        "📍 Yuqorida Yaypan shahri xaritasi.\n\n"
+        "Do'koningiz turgan joyni belgilab yuboring:\n"
+        "1️⃣ 📎 (skrepka) tugmasini bosing\n"
         "2️⃣ «Lokatsiya» (Location) ni tanlang\n"
-        "3️⃣ Xaritani surib, do'koningiz turgan joyni belgilang yoki qidiruvdan toping\n"
-        "4️⃣ «Tanlangan lokatsiyani yuborish» (Send selected location) ni bosing\n\n"
-        "⚠️ «Mening joriy joylashuvim» ni emas, aynan do'kon turgan joyni tanlang.",
+        "3️⃣ Xaritani surib, do'koningiz turgan nuqtaga qo'ying\n"
+        "4️⃣ «Tanlangan lokatsiyani yuborish» ni bosing\n\n"
+        "⚠️ «Mening joriy joylashuvim» ni emas, do'kon joyini belgilang.",
         reply_markup=geo_kb
     )
     await state.set_state(OrderState.waiting_for_geo)
+
+async def _ask_phone(message: types.Message, state: FSMContext):
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📞 Telefon raqamni yuborish", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer("Telefon raqamingizni yuboring:", reply_markup=keyboard)
+    await state.set_state(OrderState.waiting_for_phone)
 
 @dp.message(OrderState.waiting_for_geo)
 async def process_geo(message: types.Message, state: FSMContext):
@@ -754,17 +769,11 @@ async def process_geo(message: types.Message, state: FSMContext):
         await state.update_data(geo=None)
     else:
         await message.answer(
-            "Iltimos, 📎 → «Lokatsiya» orqali xaritadan do'koningiz joyini belgilab yuboring "
+            "Iltimos, 📎 → «Lokatsiya» orqali xaritadan do'kon joyini belgilab yuboring "
             "yoki «⏭ O'tkazib yuborish»ni tanlang."
         )
         return
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📞 Telefon raqamni yuborish", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await message.answer("Telefon raqamingizni yuboring:", reply_markup=keyboard)
-    await state.set_state(OrderState.waiting_for_phone)
+    await _ask_phone(message, state)
 
 @dp.message(OrderState.waiting_for_phone)
 async def process_phone(message: types.Message, state: FSMContext):
