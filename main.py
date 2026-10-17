@@ -27,6 +27,8 @@ ADMIN_ID = 8488328091
 WEBAPP_URL = "https://yaypanmuzqamoq.netlify.app/"
 # Yaypan shahri markazi (mijozlarga xarita sifatida yuboriladi)
 YAYPAN_LAT, YAYPAN_LON = 40.37583, 70.81556
+# Xaritadan joy tanlash sahifasi: geo.html ni shu netlify saytga (index.html yoniga) yuklang
+GEO_PICKER_URL = os.environ.get("GEO_PICKER_URL", WEBAPP_URL.rstrip("/") + "/geo.html") + f"?lat={YAYPAN_LAT}&lon={YAYPAN_LON}"
 # Agar Render'da Persistent Disk ulasangiz, DATA_DIR=/data qilib qo'ying
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -729,21 +731,15 @@ async def process_name(message: types.Message, state: FSMContext):
 async def process_location(message: types.Message, state: FSMContext):
     await state.update_data(location=message.text)
     geo_kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="⏭ O'tkazib yuborish")]],
+        keyboard=[
+            [KeyboardButton(text="📍 Lokatsiyani belgilash", web_app=WebAppInfo(url=GEO_PICKER_URL))],
+            [KeyboardButton(text="⏭ O'tkazib yuborish")],
+        ],
         resize_keyboard=True
     )
-    try:
-        await bot.send_location(message.chat.id, YAYPAN_LAT, YAYPAN_LON)
-    except Exception as e:
-        logging.error(f"Yaypan lokatsiyasi yuborilmadi: {e}")
     await message.answer(
-        "📍 Yuqorida Yaypan shahri xaritasi.\n\n"
-        "Do'koningiz turgan joyni belgilab yuboring:\n"
-        "1️⃣ 📎 (skrepka) tugmasini bosing\n"
-        "2️⃣ «Lokatsiya» (Location) ni tanlang\n"
-        "3️⃣ Xaritani surib, do'koningiz turgan nuqtaga qo'ying\n"
-        "4️⃣ «Tanlangan lokatsiyani yuborish» ni bosing\n\n"
-        "⚠️ «Mening joriy joylashuvim» ni emas, do'kon joyini belgilang.",
+        "📍 Pastdagi «Lokatsiyani belgilash» tugmasini bosing. Xarita Yaypandan ochiladi, "
+        "uni surib do'koningiz turgan joyni belgilang va «Tasdiqlash» ni bosing.",
         reply_markup=geo_kb
     )
     await state.set_state(OrderState.waiting_for_geo)
@@ -757,6 +753,20 @@ async def _ask_phone(message: types.Message, state: FSMContext):
     await message.answer("Telefon raqamingizni yuboring:", reply_markup=keyboard)
     await state.set_state(OrderState.waiting_for_phone)
 
+@dp.message(OrderState.waiting_for_geo, F.web_app_data)
+async def process_geo_picker(message: types.Message, state: FSMContext):
+    try:
+        d = json.loads(message.web_app_data.data)
+        lat, lon = float(d["lat"]), float(d["lon"])
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError
+    except Exception:
+        await message.answer("❌ Lokatsiya olinmadi, qaytadan «📍 Lokatsiyani belgilash» tugmasini bosing.")
+        return
+    await state.update_data(geo={"lat": lat, "lon": lon})
+    await message.answer("✅ Lokatsiya belgilandi.", reply_markup=types.ReplyKeyboardRemove())
+    await _ask_phone(message, state)
+
 @dp.message(OrderState.waiting_for_geo)
 async def process_geo(message: types.Message, state: FSMContext):
     loc = message.location or (message.venue.location if message.venue else None)
@@ -769,7 +779,7 @@ async def process_geo(message: types.Message, state: FSMContext):
         await state.update_data(geo=None)
     else:
         await message.answer(
-            "Iltimos, 📎 → «Lokatsiya» orqali xaritadan do'kon joyini belgilab yuboring "
+            "Iltimos, «📍 Lokatsiyani belgilash» tugmasini bosib xaritadan joyni belgilang "
             "yoki «⏭ O'tkazib yuborish»ni tanlang."
         )
         return
