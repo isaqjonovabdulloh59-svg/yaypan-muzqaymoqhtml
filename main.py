@@ -17,7 +17,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
-    WebAppInfo, BotCommand, MenuButtonCommands, BufferedInputFile,
+    WebAppInfo, BotCommand, MenuButtonCommands, BufferedInputFile, InputMediaPhoto,
 )
 
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -183,6 +183,41 @@ def maps_link(geo):
 
 def get_user_debt(user_id):
     return int(debts_db.get(str(user_id), {}).get("debt", 0) or 0)
+
+def get_user_location(user_id):
+    s_ = saved_users.get(str(user_id)) or {}
+    if s_.get("location"):
+        return s_["location"]
+    for o in reversed(orders_db):
+        if str(o.get("userId")) == str(user_id) and o.get("location") not in (None, "", "-"):
+            return o["location"]
+    return "-"
+
+def get_user_geo(user_id):
+    s_ = saved_users.get(str(user_id)) or {}
+    if s_.get("geo"):
+        return s_["geo"]
+    for o in reversed(orders_db):
+        if str(o.get("userId")) == str(user_id) and o.get("geo"):
+            return o["geo"]
+    return None
+
+def debt_history_text(user_id, limit=8):
+    """Mijozning qarz tarixi: sana — mahsulot: summa ... oxirida JAMI QARZ."""
+    u = debts_db.get(str(user_id))
+    if not u or u.get("debt", 0) <= 0:
+        return "📒 <b>Oldingi qarz:</b> yo'q ✅"
+    hist = u.get("history", [])
+    text = "📒 <b>Mijozning qarz tarixi:</b>\n"
+    if len(hist) > limit:
+        text += f"... (oldingi {len(hist) - limit} ta yozuv ko'rsatilmadi)\n"
+    for h in hist[-limit:]:
+        items = str(h.get("items", ""))
+        if len(items) > 60:
+            items = items[:57] + "..."
+        text += f"▫️ {h.get('date', '')} — {html.escape(items)}: {int(h.get('amount', 0)):,} so'm\n"
+    text += f"💳 <b>JAMI QARZ: {int(u['debt']):,} so'm</b>"
+    return text
 
 def get_saved_user(user_id):
     return saved_users.get(str(user_id))
@@ -393,6 +428,122 @@ def build_receipt_image(order):
 
     buf = io.BytesIO()
     img.crop((0, 0, W, y + 80)).save(buf, format="PNG")
+    return buf.getvalue()
+
+def _img_tools(d):
+    def center(text, y, font, W):
+        w = d.textlength(text, font=font)
+        d.text(((W - w) / 2, y), text, font=font, fill="black")
+    def right(text, xr, y, font):
+        w = d.textlength(text, font=font)
+        d.text((xr - w, y), text, font=font, fill="black")
+    def fit(text, font, maxw):
+        while d.textlength(text, font=font) > maxw and len(text) > 1:
+            text = text[:-2] + "…"
+        return text
+    def wrap(text, font, maxw, max_lines=2):
+        words, lines, cur = str(text).split(), [], ""
+        for w_ in words:
+            t = (cur + " " + w_).strip()
+            if d.textlength(t, font=font) <= maxw:
+                cur = t
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w_
+        if cur:
+            lines.append(cur)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = fit(lines[-1] + "…", font, maxw)
+        return lines or [""]
+    return center, right, fit, wrap
+
+def build_debts_list_image(rows, page, pages, grand_total, start=0):
+    """Qarzdorlar ro'yxati: Ism, Manzil, Telefon, Qarz, Sana."""
+    W, M = 900, 36
+    f_t, f_b, f_n = _load_font(42, True), _load_font(30, True), _load_font(26)
+    f_s = _load_font(22)
+    img = Image.new("RGB", (W, 260 + len(rows) * 180), "white")
+    d = ImageDraw.Draw(img)
+    center, right, fit, wrap = _img_tools(d)
+
+    y = 24
+    center("QARZDORLAR RO'YXATI", y, f_t, W); y += 60
+    center(f"{datetime.now().strftime('%d.%m.%Y %H:%M')}   |   {page + 1}/{pages}-sahifa", y, f_s, W); y += 44
+    d.line((M, y, W - M, y), fill="black", width=3); y += 14
+
+    for i, (uid, u) in enumerate(rows, start + 1):
+        hist = u.get("history", [])
+        first = hist[0].get("date", "-") if hist else "-"
+        last = hist[-1].get("date", "-") if hist else "-"
+        d.text((M, y), fit(f"{i}. {u.get('name', 'Noma`lum')}", f_b, 520), font=f_b, fill="black")
+        right(f"{fmt_money(u.get('debt', 0))} so'm", W - M, y, f_b); y += 42
+        d.text((M, y), fit("Manzil: " + str(get_user_location(uid)), f_n, W - 2 * M), font=f_n, fill="black"); y += 36
+        d.text((M, y), "Telefon: " + str(u.get("phone", "-")), font=f_n, fill="black"); y += 36
+        when = f"Qarz sanasi: {first}" if first == last else f"Qarz sanasi: {first}  (oxirgi: {last})"
+        d.text((M, y), fit(when, f_n, W - 2 * M), font=f_n, fill="black"); y += 40
+        d.line((M, y, W - M, y), fill="gray", width=1); y += 14
+
+    y += 6
+    d.line((M, y, W - M, y), fill="black", width=3); y += 14
+    d.text((M, y), "JAMI QARZ:", font=f_t, fill="black")
+    right(f"{fmt_money(grand_total)} so'm", W - M, y, f_t); y += 70
+
+    buf = io.BytesIO()
+    img.crop((0, 0, W, y)).save(buf, format="PNG")
+    return buf.getvalue()
+
+def build_debt_detail_image(uid, u):
+    """Bitta mijoz: ma'lumotlari + qaysi kuni nima olgani + oxirida jami qarz."""
+    W, M = 900, 36
+    f_t, f_b, f_n = _load_font(42, True), _load_font(30, True), _load_font(26)
+    f_s = _load_font(22)
+    hist = u.get("history", [])
+    shown = hist[-20:]
+    img = Image.new("RGB", (W, 700 + len(shown) * 120), "white")
+    d = ImageDraw.Draw(img)
+    center, right, fit, wrap = _img_tools(d)
+
+    y = 24
+    center("MIJOZ QARZI", y, f_t, W); y += 66
+    d.text((M, y), "Ism:", font=f_b, fill="black")
+    d.text((M + 90, y), fit(str(u.get("name", "-")), f_n, W - 2 * M - 90), font=f_n, fill="black"); y += 44
+    d.text((M, y), "Manzil:", font=f_b, fill="black")
+    d.text((M + 140, y), fit(str(get_user_location(uid)), f_n, W - 2 * M - 140), font=f_n, fill="black"); y += 44
+    d.text((M, y), "Telefon:", font=f_b, fill="black")
+    d.text((M + 150, y), str(u.get("phone", "-")), font=f_n, fill="black"); y += 56
+
+    d.line((M, y, W - M, y), fill="black", width=3); y += 8
+    d.text((M, y), "Sana", font=f_b, fill="black")
+    d.text((M + 270, y), "Mahsulot", font=f_b, fill="black")
+    right("Summa", W - M, y, f_b); y += 44
+    d.line((M, y, W - M, y), fill="black", width=3); y += 8
+
+    if len(hist) > len(shown):
+        d.text((M, y), f"... oldingi {len(hist) - len(shown)} ta yozuv ko'rsatilmadi", font=f_s, fill="gray"); y += 34
+    for h in shown:
+        lines = wrap(h.get("items", ""), f_n, W - 2 * M - 270 - 170)
+        d.text((M, y), str(h.get("date", "")), font=f_s, fill="black")
+        for ln in lines:
+            d.text((M + 270, y), ln, font=f_n, fill="black"); y += 34
+        right(fmt_money(h.get("amount", 0)), W - M, y - 34 * len(lines), f_n)
+        y += 8
+        d.line((M, y, W - M, y), fill="gray", width=1); y += 8
+
+    paid = sum(int(h.get("amount", 0)) for h in hist) - int(u.get("debt", 0))
+    if paid > 0:
+        y += 6
+        d.text((M, y), "To'langan / ayirilgan:", font=f_n, fill="black")
+        right(f"- {fmt_money(paid)} so'm", W - M, y, f_n); y += 42
+
+    y += 6
+    d.line((M, y, W - M, y), fill="black", width=3); y += 14
+    d.text((M, y), "JAMI QARZ:", font=f_t, fill="black")
+    right(f"{fmt_money(u.get('debt', 0))} so'm", W - M, y, f_t); y += 70
+
+    buf = io.BytesIO()
+    img.crop((0, 0, W, y)).save(buf, format="PNG")
     return buf.getvalue()
 
 @dp.callback_query(F.data == "print_order")
@@ -673,12 +824,13 @@ async def handle_web_app_data(message: types.Message):
 
     if isinstance(items_list, list) and items_list:
         for idx, item in enumerate(items_list, 1):
-            title = item.get("name", "Mahsulot")
+            title = str(item.get("name", "Mahsulot"))
+            title = re.sub(r"^\s*\d+\s*[.)\-]\s*", "", title).strip() or "Mahsulot"  # "17. Banan" -> "Banan"
             qty = int(item.get("count", item.get("quantity", 1)))
             price = int(item.get("price", 0))
             cost = qty * price
             total_price += cost
-            order_details += f"• {idx}. {title}: {qty} ta × {price} = {cost} so'm\n"
+            order_details += f"• {title}: {qty} ta × {price} = {cost} so'm\n"
             items_summary.append(f"{title} ({qty}ta)")
     else:
         # Текстовый резерв
@@ -694,6 +846,10 @@ async def handle_web_app_data(message: types.Message):
         "phone": user_phone,
         "items": ", ".join(items_summary) if items_summary else order_details,
         "totalPrice": total_price,
+        "userId": user_id,
+        "location": user_loc,
+        "geo": geo,
+        "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "status": "Yangi"
     }
     orders_db.append(new_order)
@@ -701,7 +857,7 @@ async def handle_web_app_data(message: types.Message):
 
     admin_message = (
         f"📥 <b>Yangi buyurtma keldi! (Mini App)</b>\n\n"
-        f"{info_text(user_name, user_loc, user_phone, geo, get_user_debt(user_id))}\n\n"
+        f"{info_text(user_name, user_loc, user_phone, geo)}\n\n{debt_history_text(user_id)}\n\n"
         f"🛍 <b>Buyurtma tarkibi:</b>\n{order_details}\n"
         f"💳 <b>Umumiy summa:</b> {total_price} so'm"
     )
@@ -839,6 +995,10 @@ async def finish_order(message: types.Message, state: FSMContext):
         "phone": user_phone,
         "items": ", ".join(items_summary),
         "totalPrice": total_price,
+        "userId": user_id,
+        "location": data.get('location') or user_saved_info.get('location') or "-",
+        "geo": geo,
+        "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "status": "Yangi"
     }
     orders_db.append(new_order)
@@ -846,7 +1006,7 @@ async def finish_order(message: types.Message, state: FSMContext):
 
     admin_message = (
         f"📥 <b>Yangi buyurtma keldi! (bot)</b>\n\n"
-        f"{info_text(user_name, data.get('location') or user_saved_info.get('location') or '-', user_phone, geo, get_user_debt(user_id))}\n\n"
+        f"{info_text(user_name, data.get('location') or user_saved_info.get('location') or '-', user_phone, geo)}\n\n{debt_history_text(user_id)}\n\n"
         f"🛍 <b>Buyurtma tarkibi:</b>\n{order_details}\n"
         f"💳 <b>Umumiy summa:</b> {total_price} so'm"
     )
@@ -862,27 +1022,70 @@ async def finish_order(message: types.Message, state: FSMContext):
     await state.clear()
 
 # ---------- Админ Панель Должников ----------
+DEBTS_PAGE_SIZE = 8
+
+def _active_debtors():
+    items = [(uid, u) for uid, u in debts_db.items() if u.get("debt", 0) > 0]
+    items.sort(key=lambda x: x[1].get("debt", 0), reverse=True)
+    return items
+
+def debts_page_content(page):
+    items = _active_debtors()
+    if not items:
+        return None
+    pages = max(1, (len(items) + DEBTS_PAGE_SIZE - 1) // DEBTS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * DEBTS_PAGE_SIZE
+    chunk = items[start:start + DEBTS_PAGE_SIZE]
+    grand = sum(u.get("debt", 0) for _, u in items)
+    png = build_debts_list_image(chunk, page, pages, grand, start=start)
+    rows = [[InlineKeyboardButton(text=f"👤 {u.get('name', '?')} — {u.get('debt', 0):,} so'm", callback_data=f"manage_debt_{uid}")]
+            for uid, u in chunk]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Oldingi", callback_data=f"debts_page_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="Keyingi ▶️", callback_data=f"debts_page_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    caption = f"💳 <b>Jami qarz: {grand:,} so'm</b>\n👥 Qarzdorlar: {len(items)} ta"
+    return png, caption, InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def swap_photo(callback_query, png, caption, kb):
+    """Yangi xabar ochmasdan, bor xabardagi rasmni almashtiradi."""
+    try:
+        media = InputMediaPhoto(media=BufferedInputFile(png, filename="qarz.png"), caption=caption, parse_mode="HTML")
+        await callback_query.message.edit_media(media=media, reply_markup=kb)
+    except Exception:
+        try:
+            await callback_query.message.delete()
+        except Exception:
+            pass
+        await callback_query.message.answer_photo(
+            BufferedInputFile(png, filename="qarz.png"), caption=caption, parse_mode="HTML", reply_markup=kb
+        )
+
 @dp.message(Command("debts"))
 async def admin_debts_list(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    
-    if not debts_db:
-        await message.answer("Qarzdorlar ro'yxati bo'sh.")
+    content = debts_page_content(0)
+    if not content:
+        await message.answer("Qarzdorlar ro'yxati bo'sh. ✅")
         return
+    png, caption, kb = content
+    await message.answer_photo(BufferedInputFile(png, filename="qarzdorlar.png"), caption=caption, parse_mode="HTML", reply_markup=kb)
 
-    text = "📋 <b>QARZDORLAR RO'YXATI:</b>\n\n"
-    keyboard_buttons = []
-    
-    for uid, udata in debts_db.items():
-        debt = udata.get("debt", 0)
-        name = udata.get("name", "Noma'lum")
-        phone = udata.get("phone", "-")
-        text += f"👤 <b>{html.escape(name)}</b> ({phone})\n💳 Qarz: {debt:,} so'm\n\n"
-        keyboard_buttons.append([InlineKeyboardButton(text=f"👤 {name} ({debt:,} so'm)", callback_data=f"manage_debt_{uid}")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+@dp.callback_query(F.data.startswith('debts_page_'))
+async def debts_page_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != ADMIN_ID:
+        return
+    content = debts_page_content(int(callback_query.data.split('_')[2]))
+    await callback_query.answer()
+    if not content:
+        await callback_query.message.answer("Qarzdorlar ro'yxati bo'sh. ✅")
+        return
+    await swap_photo(callback_query, *content)
 
 @dp.callback_query(F.data.startswith('manage_debt_'))
 async def manage_user_debt(callback_query: types.CallbackQuery):
@@ -894,26 +1097,31 @@ async def manage_user_debt(callback_query: types.CallbackQuery):
         await callback_query.answer("Mijoz topilmadi.", show_alert=True)
         return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Qarz qo'shish", callback_data=f"add_debt_{uid}"),
-         InlineKeyboardButton(text="➖ Qarzni ayirish / to'lash", callback_data=f"sub_debt_{uid}")],
-        [InlineKeyboardButton(text="🔙 Ro'yxatga qaytish", callback_data="back_to_debts")]
-    ])
-    
-    await callback_query.message.edit_text(
-        f"👤 <b>Mijoz:</b> {html.escape(u['name'])}\n"
-        f"📞 <b>Tel:</b> {u['phone']}\n"
-        f"💳 <b>Hozirgi qarzi:</b> {u['debt']:,} so'm\n\n"
-        f"Amalni tanlang:",
-        parse_mode="HTML",
-        reply_markup=kb
+    rows = [[InlineKeyboardButton(text="➕ Qarz qo'shish", callback_data=f"add_debt_{uid}"),
+             InlineKeyboardButton(text="➖ Qarzni ayirish / to'lash", callback_data=f"sub_debt_{uid}")]]
+    geo = get_user_geo(uid)
+    if geo:
+        rows.append([InlineKeyboardButton(text="🗺 Google Mapda ko'rish", url=maps_link(geo))])
+    rows.append([InlineKeyboardButton(text="🔙 Ro'yxatga qaytish", callback_data="back_to_debts")])
+
+    caption = (
+        f"👤 <b>{html.escape(str(u.get('name', '')))}</b>\n"
+        f"📞 {html.escape(str(u.get('phone', '-')))}\n"
+        f"💳 <b>Jami qarz: {u.get('debt', 0):,} so'm</b>"
     )
     await callback_query.answer()
+    await swap_photo(callback_query, build_debt_detail_image(uid, u), caption, InlineKeyboardMarkup(inline_keyboard=rows))
 
 @dp.callback_query(F.data == "back_to_debts")
 async def back_to_debts_handler(callback_query: types.CallbackQuery):
-    await callback_query.message.delete()
-    await admin_debts_list(callback_query.message)
+    if callback_query.from_user.id != ADMIN_ID:
+        return
+    await callback_query.answer()
+    content = debts_page_content(0)
+    if not content:
+        await callback_query.message.answer("Qarzdorlar ro'yxati bo'sh. ✅")
+        return
+    await swap_photo(callback_query, *content)
 
 @dp.callback_query(F.data.startswith('add_debt_'))
 async def start_add_debt(callback_query: types.CallbackQuery, state: FSMContext):
@@ -933,7 +1141,7 @@ async def process_admin_add_debt(message: types.Message, state: FSMContext):
     uid = data['target_uid']
     
     total_debt = add_user_debt(uid, "-", "-", amount, items_str="Admin tomonidan qo'shildi")
-    await message.answer(f"Mijozga {amount:,} so'm qarz qo'shildi. Umumiy qarzi: {total_debt:,} so'm.")
+    await message.answer(f"Mijozga {amount:,} so'm qarz qo'shildi.\n\n" + debt_history_text(uid), parse_mode="HTML")
     
     try:
         await bot.send_message(int(uid), f"Qarzingizga {amount:,} so'm qo'shildi.\n\n" + get_formatted_debt_text(uid), parse_mode="HTML")
@@ -970,6 +1178,25 @@ async def process_admin_sub_debt(message: types.Message, state: FSMContext):
             pass
     await state.clear()
 
+# ---------- Yetkazilmoqda ----------
+@dp.callback_query(F.data.startswith('deliv_'))
+async def process_delivering(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != ADMIN_ID:
+        return
+    target_user_id = callback_query.data.split('_')[1]
+    try:
+        await bot.send_message(int(target_user_id), "🚚 Buyurtmangiz yetkazilmoqda! Tez orada yetib boradi. Rahmat! 🍦")
+        note = "🚚 Mijozga «yetkazilmoqda» xabari yuborildi ✅"
+    except Exception as e:
+        note = f"⚠️ Mijozga xabar yuborib bo'lmadi: {e}"
+    for o in reversed(orders_db):
+        if str(o.get("userId")) == str(target_user_id) and o.get("status") == "Yangi":
+            o["status"] = "Yetkazilmoqda"
+            save_json(ORDERS_FILE, orders_db)
+            break
+    await callback_query.message.reply(note)
+    await callback_query.answer("Yuborildi ✅")
+
 # ---------- Оплата и долги при заказе (Админ) ----------
 @dp.callback_query(F.data.startswith('pay_full_'))
 async def process_pay_full(callback_query: types.CallbackQuery):
@@ -1000,7 +1227,10 @@ async def process_pay_debt(callback_query: types.CallbackQuery):
     except Exception:
         pass
 
-    await callback_query.message.reply(f"Mijoz qarziga {total_price} so'm qo'shildi. Umumiy qarzi: {total_debt} so'm.")
+    await callback_query.message.reply(
+        f"Mijoz qarziga {int(total_price):,} so'm qo'shildi.\n\n" + debt_history_text(target_user_id),
+        parse_mode="HTML"
+    )
     await callback_query.answer()
 
 @dp.callback_query(F.data.startswith('pay_part_'))
@@ -1045,7 +1275,9 @@ async def process_partial_pay_input(message: types.Message, state: FSMContext):
     else:
         msg_text = "To'lov to'liq qoplandi, qarz yozilmadi."
 
-    await message.answer(msg_text)
+    if debt_to_add > 0:
+        msg_text += "\n\n" + debt_history_text(target_user_id)
+    await message.answer(msg_text, parse_mode="HTML")
     await state.clear()
 
 @dp.message(Command("backup"))
