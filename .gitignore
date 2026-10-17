@@ -1,0 +1,6 @@
+users.json
+debts.json
+orders.json
+backup.json
+__pycache__/
+.env
