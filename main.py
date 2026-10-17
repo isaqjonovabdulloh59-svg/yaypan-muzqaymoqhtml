@@ -1295,6 +1295,67 @@ async def cmd_backup(message: types.Message):
     await _do_backup(delay=0)
     await message.answer("✅ Zaxira yuborildi va pin qilindi.")
 
+@dp.message(Command("reset_all"))
+async def cmd_reset_all(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Ha, hammasini o'chirish", callback_data="reset_all_yes"),
+        InlineKeyboardButton(text="❌ Bekor qilish", callback_data="reset_all_no"),
+    ]])
+    await message.answer(
+        "⚠️ <b>DIQQAT!</b> Barcha mijozlar, qarzlar, buyurtmalar va savatlar o'chiriladi.\n"
+        f"👥 Mijozlar: {len(saved_users)}\n💳 Qarzdorlar: {len(debts_db)}\n📥 Buyurtmalar: {len(orders_db)}\n\n"
+        "Oldin joriy holatning nusxasi sizga fayl qilib yuboriladi. Davom etasizmi?",
+        parse_mode="HTML", reply_markup=kb
+    )
+
+@dp.callback_query(F.data.in_({"reset_all_yes", "reset_all_no"}))
+async def reset_all_confirm(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id != ADMIN_ID:
+        await callback_query.answer()
+        return
+    await callback_query.message.edit_reply_markup(reply_markup=None)
+    if callback_query.data == "reset_all_no":
+        await callback_query.answer("Bekor qilindi")
+        await callback_query.message.answer("Bekor qilindi, ma'lumotlar joyida.")
+        return
+    await callback_query.answer()
+    try:
+        # 1) Xavfsizlik uchun eski holatning nusxasini yuboramiz (pin qilinmaydi)
+        await bot.send_document(
+            ADMIN_ID,
+            BufferedInputFile(_backup_payload(), filename="backup_OLD_before_reset.json"),
+            caption="🗂 Tozalashdan oldingi nusxa (kerak bo'lsa shu faylni botga yuborsangiz tiklanadi)",
+            disable_notification=True,
+        )
+    except Exception as e:
+        await callback_query.message.answer(f"❌ Nusxa yuborilmadi, tozalash to'xtatildi: {e}")
+        return
+    # 2) Xotiradagi hamma narsani tozalaymiz
+    saved_users.clear()
+    debts_db.clear()
+    orders_db.clear()
+    user_carts.clear()
+    verified_users.clear()
+    # 3) Fayllarni bo'shatamiz
+    for path, obj in ((USERS_FILE, {}), (DEBTS_FILE, {}), (ORDERS_FILE, [])):
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(obj, fh, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error(f"Tozalashda xato {path}: {e}")
+    # 4) Eski pin qilingan backup'ni olib tashlab, bo'sh yangisini pin qilamiz
+    try:
+        await bot.unpin_all_chat_messages(ADMIN_ID)
+    except Exception as e:
+        logging.error(f"Unpin xato: {e}")
+    await _do_backup(delay=0)
+    await callback_query.message.answer(
+        "✅ Hamma ma'lumot tozalandi: mijozlar, qarzlar, buyurtmalar va savatlar.\n"
+        "Endi har bir mijoz /start bosganda yangidan ro'yxatdan o'tadi."
+    )
+
 @dp.message(F.document, F.from_user.id == ADMIN_ID)
 async def admin_restore_from_file(message: types.Message):
     """Admin backup.json faylini botga yuborsa, ma'lumotlar shundan tiklanadi."""
