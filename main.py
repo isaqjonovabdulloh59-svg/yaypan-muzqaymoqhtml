@@ -727,28 +727,36 @@ async def process_name(message: types.Message, state: FSMContext):
 async def process_location(message: types.Message, state: FSMContext):
     await state.update_data(location=message.text)
     geo_kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📍 Lokatsiyamni yuborish", request_location=True)],
-            [KeyboardButton(text="⏭ O'tkazib yuborish")],
-        ],
+        keyboard=[[KeyboardButton(text="⏭ O'tkazib yuborish")]],
         resize_keyboard=True,
         one_time_keyboard=True
     )
     await message.answer(
-        "Endi aniq qayerda ekaningizni ko'rsatish uchun 📍 lokatsiyangizni yuboring.\n"
-        "(Pastdagi tugmani bosing. Yetkazib berish uchun juda kerak!)",
+        "📍 Do'koningiz joylashgan nuqtani xaritada o'zingiz belgilang:\n\n"
+        "1️⃣ Chatdagi 📎 (skrepka) tugmasini bosing\n"
+        "2️⃣ «Lokatsiya» (Location) ni tanlang\n"
+        "3️⃣ Xaritani surib, do'koningiz turgan joyni belgilang yoki qidiruvdan toping\n"
+        "4️⃣ «Tanlangan lokatsiyani yuborish» (Send selected location) ni bosing\n\n"
+        "⚠️ «Mening joriy joylashuvim» ni emas, aynan do'kon turgan joyni tanlang.",
         reply_markup=geo_kb
     )
     await state.set_state(OrderState.waiting_for_geo)
 
 @dp.message(OrderState.waiting_for_geo)
 async def process_geo(message: types.Message, state: FSMContext):
-    if message.location:
-        await state.update_data(geo={"lat": message.location.latitude, "lon": message.location.longitude})
+    loc = message.location or (message.venue.location if message.venue else None)
+    if loc:
+        if message.location and getattr(message.location, "live_period", None):
+            await message.answer("Iltimos, jonli (live) lokatsiya emas, xaritadan do'kon joylashgan nuqtani tanlab yuboring.")
+            return
+        await state.update_data(geo={"lat": loc.latitude, "lon": loc.longitude})
     elif message.text and message.text.startswith("⏭"):
         await state.update_data(geo=None)
     else:
-        await message.answer("Iltimos, «📍 Lokatsiyamni yuborish» tugmasini bosing yoki «⏭ O'tkazib yuborish»ni tanlang.")
+        await message.answer(
+            "Iltimos, 📎 → «Lokatsiya» orqali xaritadan do'koningiz joyini belgilab yuboring "
+            "yoki «⏭ O'tkazib yuborish»ni tanlang."
+        )
         return
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📞 Telefon raqamni yuborish", request_contact=True)]],
