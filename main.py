@@ -1287,6 +1287,33 @@ async def cmd_backup(message: types.Message):
     await _do_backup(delay=0)
     await message.answer("✅ Zaxira yuborildi va pin qilindi.")
 
+@dp.message(F.document, F.from_user.id == ADMIN_ID)
+async def admin_restore_from_file(message: types.Message):
+    """Admin backup.json faylini botga yuborsa, ma'lumotlar shundan tiklanadi."""
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".json"):
+        return
+    try:
+        f = await bot.get_file(doc.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(f.file_path, buf)
+        data = json.loads(buf.getvalue().decode("utf-8"))
+        if not isinstance(data, dict) or not ({"users", "debts", "orders"} & set(data.keys())):
+            await message.answer("❌ Bu zaxira (backup.json) fayliga o'xshamaydi.")
+            return
+        saved_users.clear(); saved_users.update(data.get("users", {}))
+        debts_db.clear(); debts_db.update(data.get("debts", {}))
+        orders_db[:] = data.get("orders", [])
+        save_json(USERS_FILE, saved_users)
+        save_json(DEBTS_FILE, debts_db)
+        save_json(ORDERS_FILE, orders_db)
+        await message.answer(
+            f"♻️ Fayldan tiklandi:\n👥 Mijozlar: {len(saved_users)}\n"
+            f"💳 Qarzdorlar: {len(debts_db)}\n📥 Buyurtmalar: {len(orders_db)}"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Tiklab bo'lmadi: {e}")
+
 # ---------- API (Для мобильного приложения) ----------
 async def get_orders_api(request):
     return web.json_response(orders_db)
