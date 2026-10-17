@@ -24,7 +24,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable o'rnatilmagan! Render > Environment bo'limiga qo'shing.")
 ADMIN_ID = 8488328091
-WEBAPP_URL = "https://yaypanmuzqamoq.netlify.app/"
+WEBAPP_URL = "https://yaypanmuzqaymoq.netlify.app/"
 # Yaypan shahri markazi (mijozlarga xarita sifatida yuboriladi)
 YAYPAN_LAT, YAYPAN_LON = 40.37583, 70.81556
 # Xaritadan joy tanlash sahifasi: geo.html ni shu netlify saytga (index.html yoniga) yuklang
