@@ -11,13 +11,14 @@ from aiohttp import web
 import aiohttp_cors
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton,
-    WebAppInfo, BotCommand, MenuButtonCommands, BufferedInputFile, InputMediaPhoto,
+    WebAppInfo, BotCommand, BotCommandScopeChat, MenuButtonCommands, BufferedInputFile, InputMediaPhoto,
 )
 
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -35,6 +36,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 DEBTS_FILE = os.path.join(DATA_DIR, "debts.json")    # База долгов
 ORDERS_FILE = os.path.join(DATA_DIR, "orders.json")  # База заказов
+SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")  # botga /start bosgan hamma (xabar yuborish uchun)
 CHANNEL = "@YAYPAN_muzqaymoq"
 CHANNEL_URL = "https://t.me/YAYPAN_muzqaymoq"
 
@@ -103,6 +105,15 @@ debts_db = load_json(DEBTS_FILE)
 orders_db = load_json(ORDERS_FILE)
 if not isinstance(orders_db, list):
     orders_db = []
+subscribers = load_json(SUBSCRIBERS_FILE)
+if not isinstance(subscribers, dict):
+    subscribers = {}
+
+def add_subscriber(user):
+    uid = str(user.id)
+    if uid not in subscribers:
+        subscribers[uid] = {"name": user.full_name or "", "username": user.username or ""}
+        save_json(SUBSCRIBERS_FILE, subscribers)
 
 # ---------- Telegram orqali zaxira (Render restart bo'lganda ma'lumot yo'qolmasligi uchun) ----------
 # Render bepul tarifida fayllar har restartda o'chib ketadi. Shuning uchun har o'zgarishdan keyin
@@ -125,7 +136,7 @@ def request_backup():
 
 def _backup_payload():
     return json.dumps(
-        {"users": saved_users, "debts": debts_db, "orders": orders_db},
+        {"users": saved_users, "debts": debts_db, "orders": orders_db, "subscribers": subscribers},
         ensure_ascii=False, indent=1
     ).encode("utf-8")
 
@@ -153,7 +164,7 @@ async def _do_backup(delay=10):
 async def restore_from_telegram():
     """Fayllar bo'sh bo'lsa (yangi restart), adminning pin qilingan backup.json faylidan tiklaydi."""
     global _last_backup_msg_id
-    if saved_users or debts_db or orders_db:
+    if saved_users or debts_db or orders_db or subscribers:
         return
     try:
         chat = await bot.get_chat(ADMIN_ID)
@@ -168,9 +179,10 @@ async def restore_from_telegram():
         saved_users.update(data.get("users", {}))
         debts_db.update(data.get("debts", {}))
         orders_db.extend(data.get("orders", []))
+        subscribers.update(data.get("subscribers", {}))
         _last_backup_msg_id = pm.message_id
         # Lokal fayllarga ham yozib qo'yamiz
-        for path, obj in ((USERS_FILE, saved_users), (DEBTS_FILE, debts_db), (ORDERS_FILE, orders_db)):
+        for path, obj in ((USERS_FILE, saved_users), (DEBTS_FILE, debts_db), (ORDERS_FILE, orders_db), (SUBSCRIBERS_FILE, subscribers)):
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(obj, fh, ensure_ascii=False, indent=2)
         logging.info(f"Zaxiradan tiklandi: {len(saved_users)} mijoz, {len(debts_db)} qarzdor, {len(orders_db)} buyurtma")
@@ -669,11 +681,94 @@ async def send_sticker_safe(chat_id, *emojis):
     except Exception as e:
         logging.info(f"Stiker yuborilmadi: {e}")
 
+# ---------- Hamma foydalanuvchilarga xabar yuborish (faqat admin) ----------
+class BroadcastState(StatesGroup):
+    waiting_for_message = State()
+
+def broadcast_recipients():
+    ids = set(subscribers.keys()) | set(saved_users.keys())
+    ids.discard(str(ADMIN_ID))
+    return sorted(ids)
+
+@dp.message(Command("xabar"))
+async def cmd_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await state.set_state(BroadcastState.waiting_for_message)
+    await message.answer(
+        f"📣 Xabar yuboriladigan odamlar: <b>{len(broadcast_recipients())}</b> ta\n\n"
+        "Yubormoqchi bo'lgan xabaringizni yozing (matn, rasm, video, havola, hammasi bo'ladi).\n"
+        "Bekor qilish uchun /start bosing.",
+        parse_mode="HTML"
+    )
+
+@dp.message(BroadcastState.waiting_for_message, ~F.text.startswith("/"))
+async def broadcast_preview(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.update_data(src_chat=message.chat.id, src_msg=message.message_id)
+    await bot.copy_message(message.chat.id, message.chat.id, message.message_id)
+    await message.answer(
+        f"☝️ Mana shu xabar <b>{len(broadcast_recipients())}</b> ta odamga yuboriladi. Yuboraymi?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Yuborish", callback_data="bc_send"),
+            InlineKeyboardButton(text="❌ Bekor qilish", callback_data="bc_cancel"),
+        ]])
+    )
+
+@dp.callback_query(F.data == "bc_cancel")
+async def broadcast_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await callback_query.message.edit_text("❌ Bekor qilindi.")
+    await callback_query.answer()
+
+@dp.callback_query(F.data == "bc_send")
+async def broadcast_send(callback_query: types.CallbackQuery, state: FSMContext):
+    if callback_query.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    src_chat, src_msg = data.get("src_chat"), data.get("src_msg")
+    await state.clear()
+    if not src_msg:
+        await callback_query.answer("Xabar topilmadi, /xabar dan qayta boshlang.", show_alert=True)
+        return
+    await callback_query.answer()
+    ids = broadcast_recipients()
+    status = await callback_query.message.edit_text(f"⏳ Yuborilmoqda... 0/{len(ids)}")
+    ok = blocked = failed = 0
+    for i, uid in enumerate(ids, 1):
+        try:
+            try:
+                await bot.copy_message(int(uid), src_chat, src_msg)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                await bot.copy_message(int(uid), src_chat, src_msg)
+            ok += 1
+        except TelegramForbiddenError:
+            blocked += 1   # foydalanuvchi botni bloklagan
+        except (TelegramBadRequest, Exception) as e:
+            failed += 1
+            logging.info(f"Xabar yuborilmadi {uid}: {e}")
+        if i % 25 == 0:
+            try:
+                await status.edit_text(f"⏳ Yuborilmoqda... {i}/{len(ids)}")
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)   # Telegram limiti: soniyasiga ~30 ta
+    await status.edit_text(
+        f"✅ Tayyor!\n\n📨 Yetkazildi: {ok}\n🚫 Botni bloklaganlar: {blocked}\n⚠️ Boshqa xato: {failed}"
+    )
+
 # ---------- /start и сценарий ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     await state.clear()
+    add_subscriber(message.from_user)
     if user_id != ADMIN_ID and user_id not in verified_users:
         if not await is_subscribed(user_id):
             await message.answer("👋", reply_markup=types.ReplyKeyboardRemove())
@@ -733,13 +828,16 @@ async def process_location(message: types.Message, state: FSMContext):
     geo_kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 Lokatsiyani belgilash", web_app=WebAppInfo(url=GEO_PICKER_URL))],
+            [KeyboardButton(text="📡 Hozirgi joylashuvim", request_location=True)],
             [KeyboardButton(text="⏭ O'tkazib yuborish")],
         ],
         resize_keyboard=True
     )
     await message.answer(
         "📍 Pastdagi «Lokatsiyani belgilash» tugmasini bosing. Xarita Yaypandan ochiladi, "
-        "uni surib do'koningiz turgan joyni belgilang va «Tasdiqlash» ni bosing.",
+        "uni surib do'koningiz turgan joyni belgilang va «Tasdiqlash» ni bosing.\n\n"
+        "Yoki «📡 Hozirgi joylashuvim» ni bosing. Boshqa joyni tanlash uchun 📎 (qisqich) → «Lokatsiya» "
+        "orqali xaritadan nuqtani tanlab yuborishingiz ham mumkin.",
         reply_markup=geo_kb
     )
     await state.set_state(OrderState.waiting_for_geo)
@@ -1417,6 +1515,11 @@ async def setup_bot_menu():
         BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
         BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati (Admin)"),
     ])
+    await bot.set_my_commands([
+        BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
+        BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati"),
+        BotCommand(command="xabar", description="📣 Hammaga xabar yuborish"),
+    ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 async def main():
