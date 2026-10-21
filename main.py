@@ -234,6 +234,25 @@ def save_json(filepath, data, backup=True):
     if backup:
         request_backup()
 
+saved_users = load_json(USERS_FILE)
+debts_db = load_json(DEBTS_FILE)
+orders_db = load_json(ORDERS_FILE)
+if not isinstance(orders_db, list):
+    orders_db = []
+subscribers = load_json(SUBSCRIBERS_FILE)
+if not isinstance(subscribers, dict):
+    subscribers = {}
+
+def add_subscriber(user):
+    uid = str(user.id)
+    if uid not in subscribers:
+        subscribers[uid] = {"name": user.full_name or "", "username": user.username or ""}
+        save_json(SUBSCRIBERS_FILE, subscribers)
+
+# ---------- Telegram orqali zaxira ----------
+# Har o'zgarishdan keyin barcha ma'lumot backup.json qilib adminga yuboriladi va PIN qilinadi.
+# Baza bo'sh bo'lsa, bot ishga tushganda shu pin qilingan fayldan hammasini tiklaydi.
+_backup_scheduled = False
 _last_backup_msg_id = None
 
 def request_backup():
