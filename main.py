@@ -24,7 +24,18 @@ from aiogram.types import (
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable o'rnatilmagan! Render > Environment bo'limiga qo'shing.")
-ADMIN_ID = 8488328091
+ADMIN_ID = 8488328091   # ASOSIY admin (zaxira, tiklash va to'liq tozalash faqat unda)
+
+# Qo'shimcha adminlar: ularning Telegram ID raqamini shu yerga vergul bilan yozing, masalan [111111111, 222222222]
+# Yoki Render/Netlify Environment variables'da EXTRA_ADMINS="111111111,222222222" deb yozing.
+EXTRA_ADMINS = []
+
+ADMIN_IDS = {ADMIN_ID} | {int(x) for x in EXTRA_ADMINS} | {
+    int(x) for x in os.environ.get("EXTRA_ADMINS", "").replace(" ", "").split(",") if x.strip().isdigit()
+}
+
+def is_admin(uid):
+    return uid in ADMIN_IDS
 WEBAPP_URL = "https://yaypanmuzqaymoq.netlify.app/"
 # Yaypan shahri markazi (mijozlarga xarita sifatida yuboriladi)
 YAYPAN_LAT, YAYPAN_LON = 40.37583, 70.81556
@@ -84,42 +95,145 @@ class OrderState(StatesGroup):
 
 user_carts = {}
 
+# ---------- Ma'lumotlar bazasi (PostgreSQL: Neon / Supabase) ----------
+# DATABASE_URL berilsa, ma'lumot bazada saqlanadi (hajm cheklovi yo'q, qayta ishga tushganda yo'qolmaydi).
+# Berilmasa, avvalgidek JSON fayllar ishlatiladi.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DB_ENABLED = bool(DATABASE_URL)
+_db_dirty = {}        # {fayl yo'li: obyekt} - hali bazaga yozilmagan o'zgarishlar
+_db_task = None
+_orders_saved = {}    # {indeks: json-matn} - bazada allaqachon bor buyurtmalar
+
+def _db_connect():
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL, connect_timeout=15)
+
+def _db_key(filepath):
+    return os.path.basename(filepath)
+
+def _db_init_and_load():
+    """Jadvallarni yaratadi va hamma ma'lumotni xotiraga o'qiydi. Ulanmasa, bot ISHGA TUSHMAYDI (bo'sh baza ustiga yozib yubormaslik uchun)."""
+    global _orders_saved
+    conn = _db_connect()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value JSONB NOT NULL)")
+                cur.execute("CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, data JSONB NOT NULL)")
+                cur.execute("SELECT key, value FROM kv")
+                kv = {k: v for k, v in cur.fetchall()}
+                cur.execute("SELECT id, data FROM orders ORDER BY id")
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+    orders = [d for _, d in rows]
+    _orders_saved = {i: json.dumps(o, ensure_ascii=False) for i, o in enumerate(orders)}
+    return kv, orders
+
+def _db_write(snap):
+    """snap: {fayl yo'li: json-matn yoki (buyurtmalar uchun) json-matnlar ro'yxati}"""
+    from psycopg2.extras import execute_values
+    conn = _db_connect()
+    new_orders_saved = None
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for path, val in snap.items():
+                    if path == ORDERS_FILE:
+                        changed = [(i, js) for i, js in enumerate(val) if _orders_saved.get(i) != js]
+                        if changed:
+                            execute_values(
+                                cur,
+                                "INSERT INTO orders (id, data) VALUES %s ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+                                changed, template="(%s, %s::jsonb)", page_size=500,
+                            )
+                        cur.execute("DELETE FROM orders WHERE id >= %s", (len(val),))
+                        new_orders_saved = dict(enumerate(val))
+                    else:
+                        cur.execute(
+                            "INSERT INTO kv (key, value) VALUES (%s, %s::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                            (_db_key(path), val),
+                        )
+    finally:
+        conn.close()
+    if new_orders_saved is not None:
+        _orders_saved.clear()
+        _orders_saved.update(new_orders_saved)
+
+async def _db_flush_loop():
+    global _db_task
+    try:
+        await asyncio.sleep(1.5)   # qisqa vaqt ichidagi o'zgarishlarni bitta yozuvga birlashtiramiz
+        while _db_dirty:
+            items = dict(_db_dirty)
+            _db_dirty.clear()
+            snap = {}
+            for path, obj in items.items():
+                if path == ORDERS_FILE:
+                    snap[path] = [json.dumps(o, ensure_ascii=False) for o in obj]
+                else:
+                    snap[path] = json.dumps(obj, ensure_ascii=False)
+            try:
+                await asyncio.to_thread(_db_write, snap)
+            except Exception as e:
+                logging.error(f"Bazaga yozib bo'lmadi, 10 soniyadan keyin qayta uriniladi: {e}")
+                for p, o in items.items():
+                    _db_dirty.setdefault(p, o)
+                await asyncio.sleep(10)
+    finally:
+        _db_task = None
+
+def _db_mark(filepath, data):
+    """O'zgargan ma'lumotni bazaga yozish uchun navbatga qo'yadi."""
+    global _db_task
+    _db_dirty[filepath] = data
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # event loop yo'q (masalan, bot ishga tushishidan oldin): darhol yozamiz
+        items = dict(_db_dirty)
+        _db_dirty.clear()
+        snap = {p: ([json.dumps(o, ensure_ascii=False) for o in obj] if p == ORDERS_FILE else json.dumps(obj, ensure_ascii=False))
+                for p, obj in items.items()}
+        try:
+            _db_write(snap)
+        except Exception as e:
+            logging.error(f"Bazaga yozib bo'lmadi: {e}")
+            for p, o in items.items():
+                _db_dirty.setdefault(p, o)
+        return
+    if _db_task is None:
+        _db_task = loop.create_task(_db_flush_loop())
+
+_db_kv, _db_orders = _db_init_and_load() if DB_ENABLED else ({}, [])
+if DB_ENABLED:
+    logging.info(f"Baza ulandi: {len(_db_kv)} ta jadval-kalit, {len(_db_orders)} ta buyurtma")
+
 # ---------- Операции с JSON-файлами ----------
 def load_json(filepath):
+    if DB_ENABLED:
+        if filepath.endswith("orders.json"):
+            return _db_orders
+        v = _db_kv.get(_db_key(filepath))
+        return v if v is not None else {}
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return [] if filepath.endswith("orders.json") else {}
 
-def save_json(filepath, data):
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.error(f"Ошибка записи в {filepath}: {e}")
-    request_backup()
+def save_json(filepath, data, backup=True):
+    if DB_ENABLED:
+        _db_mark(filepath, data)
+    else:
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error(f"Ошибка записи в {filepath}: {e}")
+    if backup:
+        request_backup()
 
-saved_users = load_json(USERS_FILE)
-debts_db = load_json(DEBTS_FILE)
-orders_db = load_json(ORDERS_FILE)
-if not isinstance(orders_db, list):
-    orders_db = []
-subscribers = load_json(SUBSCRIBERS_FILE)
-if not isinstance(subscribers, dict):
-    subscribers = {}
-
-def add_subscriber(user):
-    uid = str(user.id)
-    if uid not in subscribers:
-        subscribers[uid] = {"name": user.full_name or "", "username": user.username or ""}
-        save_json(SUBSCRIBERS_FILE, subscribers)
-
-# ---------- Telegram orqali zaxira (Render restart bo'lganda ma'lumot yo'qolmasligi uchun) ----------
-# Render bepul tarifida fayllar har restartda o'chib ketadi. Shuning uchun har o'zgarishdan keyin
-# barcha ma'lumot bitta backup.json qilib adminga yuboriladi va PIN qilinadi.
-# Bot qayta ishga tushganda shu pin qilingan fayldan hammasi tiklanadi.
-_backup_scheduled = False
 _last_backup_msg_id = None
 
 def request_backup():
@@ -135,10 +249,17 @@ def request_backup():
     loop.create_task(_do_backup())
 
 def _backup_payload():
-    return json.dumps(
-        {"users": saved_users, "debts": debts_db, "orders": orders_db, "subscribers": subscribers},
-        ensure_ascii=False, indent=1
-    ).encode("utf-8")
+    orders = list(orders_db)
+    while True:
+        data = json.dumps(
+            {"users": saved_users, "debts": debts_db, "orders": orders, "subscribers": subscribers},
+            ensure_ascii=False, indent=1
+        ).encode("utf-8")
+        # Telegram'dan yuklab olish chegarasi 20 MB: oshib ketsa, eng eski buyurtmalarni zaxiradan chiqaramiz
+        # (baza ishlatilsa, ular bazada baribir saqlanib turadi)
+        if len(data) <= 15_000_000 or len(orders) <= 100:
+            return data
+        orders = orders[len(orders) // 4:]
 
 async def _do_backup(delay=10):
     global _backup_scheduled, _last_backup_msg_id
@@ -183,8 +304,7 @@ async def restore_from_telegram():
         _last_backup_msg_id = pm.message_id
         # Lokal fayllarga ham yozib qo'yamiz
         for path, obj in ((USERS_FILE, saved_users), (DEBTS_FILE, debts_db), (ORDERS_FILE, orders_db), (SUBSCRIBERS_FILE, subscribers)):
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(obj, fh, ensure_ascii=False, indent=2)
+            save_json(path, obj, backup=False)
         logging.info(f"Zaxiradan tiklandi: {len(saved_users)} mijoz, {len(debts_db)} qarzdor, {len(orders_db)} buyurtma")
         await bot.send_message(
             ADMIN_ID,
@@ -337,16 +457,17 @@ def admin_order_keyboard(user_id, total_price, geo=None):
     ])
 
 async def send_admin_order(user_id, admin_message, total_price, geo=None):
-    await bot.send_message(
-        ADMIN_ID, admin_message, parse_mode="HTML",
-        reply_markup=admin_order_keyboard(user_id, total_price, geo),
-        disable_web_page_preview=True,
-    )
-    if geo:
+    for admin in ADMIN_IDS:
         try:
-            await bot.send_location(ADMIN_ID, geo["lat"], geo["lon"])
+            await bot.send_message(
+                admin, admin_message, parse_mode="HTML",
+                reply_markup=admin_order_keyboard(user_id, total_price, geo),
+                disable_web_page_preview=True,
+            )
+            if geo:
+                await bot.send_location(admin, geo["lat"], geo["lon"])
         except Exception as e:
-            logging.warning(f"Lokatsiya yuborilmadi: {e}")
+            logging.warning(f"Adminga ({admin}) buyurtma yuborilmadi: {e}")
 
 def fmt_money(n):
     return f"{int(n):,}".replace(",", " ")
@@ -564,7 +685,7 @@ def build_debt_detail_image(uid, u):
 
 @dp.callback_query(F.data == "print_order")
 async def print_order(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("Bu tugma faqat admin uchun!", show_alert=True)
         return
     order = parse_order_text(callback_query.message.text or callback_query.message.caption or "")
@@ -617,7 +738,7 @@ async def send_subscribe_prompt(message: types.Message):
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
-        if user is None or user.id == ADMIN_ID or user.id in verified_users:
+        if user is None or is_admin(user.id) or user.id in verified_users:
             return await handler(event, data)
         if isinstance(event, types.Message) and (event.text or "").startswith("/start"):
             return await handler(event, data)
@@ -687,12 +808,13 @@ class BroadcastState(StatesGroup):
 
 def broadcast_recipients():
     ids = set(subscribers.keys()) | set(saved_users.keys())
-    ids.discard(str(ADMIN_ID))
+    for a in ADMIN_IDS:
+        ids.discard(str(a))
     return sorted(ids)
 
 @dp.message(Command("xabar"))
 async def cmd_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     await state.clear()
     await state.set_state(BroadcastState.waiting_for_message)
@@ -705,7 +827,7 @@ async def cmd_broadcast(message: types.Message, state: FSMContext):
 
 @dp.message(BroadcastState.waiting_for_message, ~F.text.startswith("/"))
 async def broadcast_preview(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     await state.update_data(src_chat=message.chat.id, src_msg=message.message_id)
     await bot.copy_message(message.chat.id, message.chat.id, message.message_id)
@@ -720,7 +842,7 @@ async def broadcast_preview(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "bc_cancel")
 async def broadcast_cancel(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     await state.clear()
     await callback_query.message.edit_text("❌ Bekor qilindi.")
@@ -728,7 +850,7 @@ async def broadcast_cancel(callback_query: types.CallbackQuery, state: FSMContex
 
 @dp.callback_query(F.data == "bc_send")
 async def broadcast_send(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     data = await state.get_data()
     src_chat, src_msg = data.get("src_chat"), data.get("src_msg")
@@ -769,7 +891,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     await state.clear()
     add_subscriber(message.from_user)
-    if user_id != ADMIN_ID and user_id not in verified_users:
+    if not is_admin(user_id) and user_id not in verified_users:
         if not await is_subscribed(user_id):
             await message.answer("👋", reply_markup=types.ReplyKeyboardRemove())
             await send_subscribe_prompt(message)
@@ -1192,7 +1314,7 @@ async def swap_photo(callback_query, png, caption, kb):
 
 @dp.message(Command("debts"))
 async def admin_debts_list(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     content = debts_page_content(0)
     if not content:
@@ -1203,7 +1325,7 @@ async def admin_debts_list(message: types.Message):
 
 @dp.callback_query(F.data.startswith('debts_page_'))
 async def debts_page_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     content = debts_page_content(int(callback_query.data.split('_')[2]))
     await callback_query.answer()
@@ -1214,7 +1336,7 @@ async def debts_page_handler(callback_query: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith('manage_debt_'))
 async def manage_user_debt(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     uid = callback_query.data.split('_')[2]
     u = debts_db.get(uid)
@@ -1239,7 +1361,7 @@ async def manage_user_debt(callback_query: types.CallbackQuery):
 
 @dp.callback_query(F.data == "back_to_debts")
 async def back_to_debts_handler(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     await callback_query.answer()
     content = debts_page_content(0)
@@ -1258,7 +1380,7 @@ async def start_add_debt(callback_query: types.CallbackQuery, state: FSMContext)
 
 @dp.message(OrderState.waiting_for_admin_debt_add)
 async def process_admin_add_debt(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID or not message.text.isdigit():
+    if not is_admin(message.from_user.id) or not message.text.isdigit():
         await message.answer("Faqat raqam kiriting:")
         return
     amount = int(message.text)
@@ -1284,7 +1406,7 @@ async def start_sub_debt(callback_query: types.CallbackQuery, state: FSMContext)
 
 @dp.message(OrderState.waiting_for_admin_debt_sub)
 async def process_admin_sub_debt(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID or not message.text.isdigit():
+    if not is_admin(message.from_user.id) or not message.text.isdigit():
         await message.answer("Faqat raqam kiriting:")
         return
     amount = int(message.text)
@@ -1306,7 +1428,7 @@ async def process_admin_sub_debt(message: types.Message, state: FSMContext):
 # ---------- Yetkazilmoqda ----------
 @dp.callback_query(F.data.startswith('deliv_'))
 async def process_delivering(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     target_user_id = callback_query.data.split('_')[1]
     try:
@@ -1325,7 +1447,7 @@ async def process_delivering(callback_query: types.CallbackQuery):
 # ---------- Оплата и долги при заказе (Админ) ----------
 @dp.callback_query(F.data.startswith('pay_full_'))
 async def process_pay_full(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     _, _, target_user_id, total_price = callback_query.data.split('_')
     
@@ -1339,7 +1461,7 @@ async def process_pay_full(callback_query: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith('pay_debt_'))
 async def process_pay_debt(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     _, _, target_user_id, total_price = callback_query.data.split('_')
     
@@ -1360,7 +1482,7 @@ async def process_pay_debt(callback_query: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith('pay_part_'))
 async def process_pay_part(callback_query: types.CallbackQuery, state: FSMContext):
-    if callback_query.from_user.id != ADMIN_ID:
+    if not is_admin(callback_query.from_user.id):
         return
     _, _, target_user_id, total_price = callback_query.data.split('_')
     
@@ -1375,7 +1497,7 @@ async def process_pay_part(callback_query: types.CallbackQuery, state: FSMContex
 
 @dp.message(OrderState.waiting_for_partial_pay)
 async def process_partial_pay_input(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     if not message.text or not message.text.isdigit():
         await message.answer("Iltimos, faqat raqam kiriting:")
@@ -1455,11 +1577,10 @@ async def reset_all_confirm(callback_query: types.CallbackQuery, state: FSMConte
     orders_db.clear()
     user_carts.clear()
     verified_users.clear()
-    # 3) Fayllarni bo'shatamiz
-    for path, obj in ((USERS_FILE, {}), (DEBTS_FILE, {}), (ORDERS_FILE, [])):
+    # 3) Fayllarni / bazani bo'shatamiz
+    for path, obj in ((USERS_FILE, saved_users), (DEBTS_FILE, debts_db), (ORDERS_FILE, orders_db)):
         try:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(obj, fh, ensure_ascii=False, indent=2)
+            save_json(path, obj, backup=False)
         except Exception as e:
             logging.error(f"Tozalashda xato {path}: {e}")
     # 4) Eski pin qilingan backup'ni olib tashlab, bo'sh yangisini pin qilamiz
@@ -1515,11 +1636,15 @@ async def setup_bot_menu():
         BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
         BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati (Admin)"),
     ])
-    await bot.set_my_commands([
-        BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
-        BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati"),
-        BotCommand(command="xabar", description="📣 Hammaga xabar yuborish"),
-    ], scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    for _adm in ADMIN_IDS:
+        try:
+            await bot.set_my_commands([
+                BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
+                BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati"),
+                BotCommand(command="xabar", description="📣 Hammaga xabar yuborish"),
+            ], scope=BotCommandScopeChat(chat_id=_adm))
+        except Exception as e:
+            logging.warning(f"Admin menyusi ({_adm}): {e}")
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 async def main():
