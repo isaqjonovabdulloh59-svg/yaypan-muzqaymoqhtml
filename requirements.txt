@@ -1,4 +1,5 @@
-aiogram>=3.0.0
+aiogram>=3.0
 aiohttp
-aiohttp_cors
+aiohttp-cors
 Pillow
+psycopg2-binary
