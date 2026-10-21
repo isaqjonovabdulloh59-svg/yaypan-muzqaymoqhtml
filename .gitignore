@@ -1,6 +1,8 @@
 users.json
 debts.json
 orders.json
+subscribers.json
 backup.json
 __pycache__/
+*.pyc
 .env
