@@ -1348,6 +1348,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     await state.clear()
     add_subscriber(message.from_user)
+    if is_admin(user_id):
+        await set_admin_menu(user_id)
     if not is_admin(user_id) and user_id not in verified_users:
         if not await is_subscribed(user_id):
             await message.answer("👋", reply_markup=types.ReplyKeyboardRemove())
@@ -2230,22 +2232,27 @@ async def post_notify_api(request):
 async def handle_ping(request):
     return web.Response(text="Bot va API ishlamoqda!")
 
+async def set_admin_menu(chat_id):
+    """Adminning o'ziga to'liq buyruqlar menyusini o'rnatadi."""
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
+            BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati"),
+            BotCommand(command="xabar", description="📣 Hammaga xabar yuborish"),
+            BotCommand(command="yangi", description="➕ Yangi muzqaymoq qo'shish"),
+            BotCommand(command="holat", description="📦 Muzqaymoq bor / tugadi"),
+            BotCommand(command="tahrir", description="✏️ Muzqaymoqni tahrirlash / o'chirish"),
+        ], scope=BotCommandScopeChat(chat_id=chat_id))
+        await bot.set_chat_menu_button(chat_id=chat_id, menu_button=MenuButtonCommands())
+    except Exception as e:
+        logging.warning(f"Admin menyusi ({chat_id}): {e}")
+
 async def setup_bot_menu():
     await bot.set_my_commands([
         BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
     ])
     for _adm in ADMIN_IDS:
-        try:
-            await bot.set_my_commands([
-                BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
-                BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati"),
-                BotCommand(command="xabar", description="📣 Hammaga xabar yuborish"),
-                BotCommand(command="yangi", description="➕ Yangi muzqaymoq qo'shish"),
-                BotCommand(command="holat", description="📦 Muzqaymoq bor / tugadi"),
-                BotCommand(command="tahrir", description="✏️ Muzqaymoqni tahrirlash / o'chirish"),
-            ], scope=BotCommandScopeChat(chat_id=_adm))
-        except Exception as e:
-            logging.warning(f"Admin menyusi ({_adm}): {e}")
+        await set_admin_menu(_adm)
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 async def main():
