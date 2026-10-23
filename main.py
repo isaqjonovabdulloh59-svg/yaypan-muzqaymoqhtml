@@ -5,6 +5,10 @@ import json
 import html
 import re
 import io
+import copy
+import hmac
+import hashlib
+import urllib.parse
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 from aiohttp import web
@@ -48,6 +52,7 @@ USERS_FILE = os.path.join(DATA_DIR, "users.json")
 DEBTS_FILE = os.path.join(DATA_DIR, "debts.json")    # База долгов
 ORDERS_FILE = os.path.join(DATA_DIR, "orders.json")  # База заказов
 SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")  # botga /start bosgan hamma (xabar yuborish uchun)
+PRODUCTS_FILE = os.path.join(DATA_DIR, "products.json")  # admin qo'shgan muzqaymoqlar, tugaganlar, "xabar bering" so'rovlari
 CHANNEL = "@YAYPAN_muzqaymoq"
 CHANNEL_URL = "https://t.me/YAYPAN_muzqaymoq"
 
@@ -249,6 +254,86 @@ def add_subscriber(user):
         subscribers[uid] = {"name": user.full_name or "", "username": user.username or ""}
         save_json(SUBSCRIBERS_FILE, subscribers)
 
+# ---------- Qo'shimcha muzqaymoqlar, "tugadi" holati va "xabar bering" so'rovlari ----------
+BASE_PRODUCTS = copy.deepcopy(PRODUCTS)   # kodda yozilgan asl ro'yxat (o'zgarmaydi)
+products_state = {}
+
+def apply_products_state():
+    """Asl ro'yxat + admin qo'shganlar + tahrirlar - o'chirilganlar = hozirgi PRODUCTS."""
+    PRODUCTS.clear()
+    for k, p in BASE_PRODUCTS.items():
+        PRODUCTS[k] = dict(p)
+    for k, p in products_state["custom"].items():
+        PRODUCTS[k] = dict(p)
+    for k, e in products_state["edits"].items():
+        if k in PRODUCTS:
+            PRODUCTS[k].update(e)
+    for k in products_state["deleted"]:
+        PRODUCTS.pop(k, None)
+
+def load_products_state(data):
+    products_state.clear()
+    if isinstance(data, dict):
+        products_state.update(data)
+    products_state.setdefault("custom", {})    # admin qo'shgan muzqaymoqlar
+    products_state.setdefault("out", [])       # tugagan muzqaymoqlar kalitlari
+    products_state.setdefault("waiting", {})   # {mahsulot_kaliti: [user_id, ...]} - kelsa xabar kutayotganlar
+    products_state.setdefault("edits", {})     # {kalit: {name/price/count_in_box/photo: yangi qiymat}}
+    products_state.setdefault("deleted", [])   # o'chirilgan (asl ro'yxatdagi) muzqaymoqlar kalitlari
+    apply_products_state()
+
+load_products_state(load_json(PRODUCTS_FILE))
+
+def save_products():
+    save_json(PRODUCTS_FILE, products_state)
+
+def is_in_stock(key):
+    return key not in products_state["out"]
+
+def next_custom_key():
+    n = 1
+    while f"new{n}" in PRODUCTS:
+        n += 1
+    return f"new{n}"
+
+def add_waiting(key, user_id):
+    """Tugagan muzqaymoqni so'ragan odamni ro'yxatga yozadi (kelsa xabar yuboriladi)."""
+    lst = products_state["waiting"].setdefault(key, [])
+    if user_id not in lst:
+        lst.append(user_id)
+        save_products()
+
+def out_of_stock_text(key):
+    return (
+        f"😔 <b>{html.escape(PRODUCTS[key]['name'])}</b> hozircha tugadi.\n"
+        f"Agar yetib kelsa, sizga xabar yuboramiz 🔔"
+    )
+
+async def reply_out_of_stock(callback_query, key):
+    add_waiting(key, callback_query.from_user.id)
+    await callback_query.message.answer(out_of_stock_text(key), parse_mode="HTML")
+    await callback_query.answer("Bu muzqaymoq tugadi 😔")
+
+async def notify_waiting(key, users):
+    """Muzqaymoq yetib kelganda uni so'ragan odamlarga xabar yuboradi. Yuborilganlar sonini qaytaradi."""
+    text = (
+        f"🍦 Yaxshi xabar! <b>{html.escape(PRODUCTS[key]['name'])}</b> endi mavjud!\n"
+        f"Buyurtma berishingiz mumkin 😊 (katalogdan tanlang yoki /start bosing)"
+    )
+    sent = 0
+    for uid in users:
+        try:
+            try:
+                await bot.send_message(int(uid), text, parse_mode="HTML")
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                await bot.send_message(int(uid), text, parse_mode="HTML")
+            sent += 1
+        except Exception as e:
+            logging.info(f"Xabar yuborilmadi {uid}: {e}")
+        await asyncio.sleep(0.05)
+    return sent
+
 # ---------- Telegram orqali zaxira ----------
 # Har o'zgarishdan keyin barcha ma'lumot backup.json qilib adminga yuboriladi va PIN qilinadi.
 # Baza bo'sh bo'lsa, bot ishga tushganda shu pin qilingan fayldan hammasini tiklaydi.
@@ -273,7 +358,7 @@ def _backup_payload():
     orders = list(orders_db)
     while True:
         data = json.dumps(
-            {"users": saved_users, "debts": debts_db, "orders": orders, "subscribers": subscribers},
+            {"users": saved_users, "debts": debts_db, "orders": orders, "subscribers": subscribers, "products": products_state},
             ensure_ascii=False, indent=1
         ).encode("utf-8")
         # Telegram'dan yuklab olish chegarasi 20 MB: oshib ketsa, eng eski buyurtmalarni zaxiradan chiqaramiz
@@ -282,13 +367,13 @@ def _backup_payload():
             return data
         orders = orders[len(orders) // 4:]
 
-async def _do_backup(delay=10):
+async def _do_backup(delay=10, force=False):
     global _backup_scheduled, _last_backup_msg_id
     await asyncio.sleep(delay)
     _backup_scheduled = False
     # HIMOYA: ma'lumot butunlay bo'sh bo'lsa, zaxirani yubormaymiz. Aks holda bo'sh zaxira
     # pin qilingan yaxshi zaxiraning o'rniga o'tib, eskisi o'chib ketardi.
-    if not (saved_users or debts_db or orders_db):
+    if not force and not (saved_users or debts_db or orders_db):
         logging.info("Ma'lumot bo'sh: zaxira yuborilmadi (eski zaxira saqlab qolindi).")
         return
     try:
@@ -329,9 +414,11 @@ async def restore_from_telegram():
         debts_db.update(data.get("debts", {}))
         orders_db.extend(data.get("orders", []))
         subscribers.update(data.get("subscribers", {}))
+        if data.get("products"):
+            load_products_state(data["products"])
         _last_backup_msg_id = pm.message_id
         # Lokal fayllarga ham yozib qo'yamiz
-        for path, obj in ((USERS_FILE, saved_users), (DEBTS_FILE, debts_db), (ORDERS_FILE, orders_db), (SUBSCRIBERS_FILE, subscribers)):
+        for path, obj in ((USERS_FILE, saved_users), (DEBTS_FILE, debts_db), (ORDERS_FILE, orders_db), (SUBSCRIBERS_FILE, subscribers), (PRODUCTS_FILE, products_state)):
             save_json(path, obj, backup=False)
         logging.info(f"Zaxiradan tiklandi: {len(saved_users)} mijoz, {len(debts_db)} qarzdor, {len(orders_db)} buyurtma")
         await bot.send_message(
@@ -913,6 +1000,348 @@ async def broadcast_send(callback_query: types.CallbackQuery, state: FSMContext)
         f"✅ Tayyor!\n\n📨 Yetkazildi: {ok}\n🚫 Botni bloklaganlar: {blocked}\n⚠️ Boshqa xato: {failed}"
     )
 
+# ---------- Muzqaymoq qo'shish va "bor / tugadi" holati (faqat admin) ----------
+class ProductAdminState(StatesGroup):
+    name = State()
+    count = State()
+    price = State()
+    photo = State()
+
+@dp.message(Command("yangi"))
+async def cmd_new_product(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await state.set_state(ProductAdminState.name)
+    await message.answer(
+        "🍦 Yangi muzqaymoq nomini yozing (masalan: Pistali).\nBekor qilish uchun /start bosing.",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+@dp.message(ProductAdminState.name, F.text, ~F.text.startswith("/"))
+async def new_product_name(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.update_data(p_name=message.text.strip()[:60])
+    await state.set_state(ProductAdminState.count)
+    await message.answer("📦 Bitta qutida nechta dona bor? Raqam yozing (masalan: 50):")
+
+@dp.message(ProductAdminState.count, F.text, ~F.text.startswith("/"))
+async def new_product_count(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    t = message.text.replace(" ", "")
+    if not t.isdigit() or int(t) <= 0:
+        await message.answer("Iltimos, faqat raqam kiriting (masalan: 50):")
+        return
+    await state.update_data(p_count=int(t))
+    await state.set_state(ProductAdminState.price)
+    await message.answer("💰 Bitta dona narxi necha so'm? (masalan: 1600):")
+
+@dp.message(ProductAdminState.price, F.text, ~F.text.startswith("/"))
+async def new_product_price(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    t = message.text.replace(" ", "")
+    if not t.isdigit() or int(t) <= 0:
+        await message.answer("Iltimos, faqat raqam kiriting (masalan: 1600):")
+        return
+    await state.update_data(p_price=int(t))
+    await state.set_state(ProductAdminState.photo)
+    await message.answer(
+        "📷 Muzqaymoq rasmini yuboring (yoki rasm havolasini yozing).\nRasm kerak bo'lmasa «⏭ O'tkazib yuborish» ni bosing.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⏭ O'tkazib yuborish")]], resize_keyboard=True)
+    )
+
+async def _finish_new_product(message: types.Message, state: FSMContext, photo):
+    data = await state.get_data()
+    key = next_custom_key()
+    prod = {"name": data["p_name"], "count_in_box": data["p_count"], "price": data["p_price"], "photo": photo}
+    products_state["custom"][key] = prod
+    apply_products_state()
+    save_products()
+    await state.clear()
+    await message.answer(
+        f"✅ <b>{html.escape(prod['name'])}</b> qo'shildi!\n"
+        f"📦 Qutida: {prod['count_in_box']} ta\n💰 Dona narxi: {prod['price']} so'm\n\n"
+        "Mijozlar /start bosganda katalogda ko'radi.\n"
+        "Bor/tugadi holatini o'zgartirish: /holat",
+        parse_mode="HTML", reply_markup=main_menu_keyboard
+    )
+
+@dp.message(ProductAdminState.photo, F.photo)
+async def new_product_photo(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await _finish_new_product(message, state, message.photo[-1].file_id)
+
+@dp.message(ProductAdminState.photo, F.text, ~F.text.startswith("/"))
+async def new_product_photo_text(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    t = message.text.strip()
+    if t.startswith("⏭"):
+        await _finish_new_product(message, state, None)
+    elif t.startswith("http"):
+        await _finish_new_product(message, state, t)
+    else:
+        await message.answer("Rasm yuboring yoki «⏭ O'tkazib yuborish» ni bosing.")
+
+def stock_panel_text():
+    return (
+        "📦 <b>Muzqaymoqlar holati</b>\n"
+        "✅ — bor, ❌ — tugagan. Bosib holatini o'zgartiring.\n"
+        "Tugagan muzqaymoq «bor» qilinsa, uni so'raganlarga avtomatik xabar ketadi (🔔 — kutayotganlar soni)."
+    )
+
+def stock_keyboard():
+    rows = []
+    for key, prod in PRODUCTS.items():
+        if is_in_stock(key):
+            label = f"✅ {prod['name']}"
+        else:
+            n = len(products_state["waiting"].get(key, []))
+            label = f"❌ {prod['name']}" + (f" (🔔 {n})" if n else "")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"stk_{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.message(Command("holat"))
+async def cmd_stock(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(stock_panel_text(), parse_mode="HTML", reply_markup=stock_keyboard())
+
+@dp.callback_query(F.data.startswith("stk_"))
+async def toggle_stock(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer()
+        return
+    key = callback_query.data.split("_", 1)[1]
+    prod = PRODUCTS.get(key)
+    if not prod:
+        await callback_query.answer("Muzqaymoq topilmadi.", show_alert=True)
+        return
+    users = []
+    if is_in_stock(key):
+        products_state["out"].append(key)
+        note = f"❌ {prod['name']} — tugadi deb belgilandi"
+    else:
+        products_state["out"].remove(key)
+        users = products_state["waiting"].pop(key, [])
+        note = f"✅ {prod['name']} — mavjud deb belgilandi"
+    save_products()
+    await callback_query.answer(note)
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=stock_keyboard())
+    except Exception:
+        pass
+    if users:
+        sent = await notify_waiting(key, users)
+        await callback_query.message.answer(
+            f"📨 «{prod['name']}» mavjud ekani haqida {sent}/{len(users)} ta odamga xabar yuborildi."
+        )
+
+# ---------- Muzqaymoqni tahrirlash va o'chirish (faqat admin) ----------
+class ProductEditState(StatesGroup):
+    value = State()
+
+EDIT_FIELDS = {  # callback nomi: (mahsulotdagi kalit, so'rov matni)
+    "name": ("name", "✏️ Yangi nomini yozing:"),
+    "price": ("price", "✏️ Yangi dona narxini yozing (so'm, masalan 1600):"),
+    "count": ("count_in_box", "✏️ Qutida nechta dona borligini yozing (masalan 50):"),
+    "photo": ("photo", "🖼 Yangi rasmni yuboring (yoki rasm havolasini yozing):"),
+}
+
+def product_card_text(key):
+    p = PRODUCTS[key]
+    return (
+        f"🍦 <b>{html.escape(p['name'])}</b>\n"
+        f"📦 Qutida: {p['count_in_box']} ta\n"
+        f"💰 Dona narxi: {p['price']} so'm\n"
+        f"🖼 Rasm: {'bor' if p.get('photo') else 'yoq'}\n"
+        f"{'✅ Mavjud' if is_in_stock(key) else '❌ Tugagan'}"
+    )
+
+def edit_menu_keyboard(key):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Nomi", callback_data=f"tf_name_{key}"),
+         InlineKeyboardButton(text="💰 Narxi", callback_data=f"tf_price_{key}")],
+        [InlineKeyboardButton(text="📦 Qutidagi soni", callback_data=f"tf_count_{key}"),
+         InlineKeyboardButton(text="🖼 Rasmi", callback_data=f"tf_photo_{key}")],
+        [InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"td_{key}")],
+        [InlineKeyboardButton(text="🔙 Ro'yxatga qaytish", callback_data="tback")],
+    ])
+
+def edit_list_keyboard():
+    rows = [[InlineKeyboardButton(text=p['name'], callback_data=f"te_{k}")] for k, p in PRODUCTS.items()]
+    gone = [k for k in products_state["deleted"] if k in BASE_PRODUCTS]
+    if gone:
+        rows.append([InlineKeyboardButton(text=f"♻️ O'chirilganlar ({len(gone)})", callback_data="tdl")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+EDIT_LIST_TEXT = "✏️ Qaysi muzqaymoqni tahrirlash yoki o'chirmoqchisiz?"
+
+async def _edit_msg(callback_query, text, kb):
+    try:
+        await callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        pass
+
+@dp.message(Command("tahrir"))
+async def cmd_edit_products(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer(EDIT_LIST_TEXT, reply_markup=edit_list_keyboard())
+
+@dp.callback_query(F.data == "tback")
+async def edit_back(callback_query: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer()
+        return
+    await state.clear()
+    await callback_query.answer()
+    await _edit_msg(callback_query, EDIT_LIST_TEXT, edit_list_keyboard())
+
+@dp.callback_query(F.data.startswith("te_"))
+async def edit_open(callback_query: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer()
+        return
+    key = callback_query.data.split("_", 1)[1]
+    if key not in PRODUCTS:
+        await callback_query.answer("Muzqaymoq topilmadi.", show_alert=True)
+        return
+    await state.clear()
+    await callback_query.answer()
+    await _edit_msg(callback_query, product_card_text(key), edit_menu_keyboard(key))
+
+@dp.callback_query(F.data.startswith("tf_"))
+async def edit_field_ask(callback_query: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer()
+        return
+    _, field, key = callback_query.data.split("_", 2)
+    if key not in PRODUCTS or field not in EDIT_FIELDS:
+        await callback_query.answer("Muzqaymoq topilmadi.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(ProductEditState.value)
+    await state.update_data(edit_key=key, edit_field=field)
+    await callback_query.answer()
+    await callback_query.message.answer(EDIT_FIELDS[field][1] + "\n(Bekor qilish: /tahrir)")
+
+async def _apply_edit(message: types.Message, state: FSMContext, value):
+    data = await state.get_data()
+    key, field = data.get("edit_key"), data.get("edit_field")
+    if key not in PRODUCTS or field not in EDIT_FIELDS:
+        await state.clear()
+        await message.answer("Muzqaymoq topilmadi. /tahrir dan qayta boshlang.")
+        return
+    products_state["edits"].setdefault(key, {})[EDIT_FIELDS[field][0]] = value
+    apply_products_state()
+    save_products()
+    await state.clear()
+    await message.answer("✅ Saqlandi!\n\n" + product_card_text(key), parse_mode="HTML", reply_markup=edit_menu_keyboard(key))
+
+@dp.message(ProductEditState.value, F.photo)
+async def edit_value_photo(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if (await state.get_data()).get("edit_field") != "photo":
+        await message.answer("Bu yerga rasm emas, matn yoki raqam yuboring.")
+        return
+    await _apply_edit(message, state, message.photo[-1].file_id)
+
+@dp.message(ProductEditState.value, F.text, ~F.text.startswith("/"))
+async def edit_value_text(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    field = (await state.get_data()).get("edit_field")
+    t = message.text.strip()
+    if field == "name":
+        if not t:
+            await message.answer("Nom bo'sh bo'lmasin:")
+            return
+        await _apply_edit(message, state, t[:60])
+    elif field in ("price", "count"):
+        t = t.replace(" ", "")
+        if not t.isdigit() or int(t) <= 0:
+            await message.answer("Iltimos, 0 dan katta raqam kiriting:")
+            return
+        await _apply_edit(message, state, int(t))
+    elif field == "photo":
+        if not t.startswith("http"):
+            await message.answer("Rasm yuboring yoki https:// bilan boshlanadigan havola yozing:")
+            return
+        await _apply_edit(message, state, t)
+
+@dp.callback_query(F.data.startswith("td_"))
+async def edit_delete_ask(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer()
+        return
+    key = callback_query.data.split("_", 1)[1]
+    if key not in PRODUCTS:
+        await callback_query.answer("Muzqaymoq topilmadi.", show_alert=True)
+        return
+    await callback_query.answer()
+    await _edit_msg(
+        callback_query,
+        f"🗑 <b>{html.escape(PRODUCTS[key]['name'])}</b> o'chirilsinmi?\nU katalogdan va Mini App'dan olib tashlanadi.",
+        InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Ha, o'chirish", callback_data=f"ty_{key}"),
+            InlineKeyboardButton(text="❌ Yo'q", callback_data=f"te_{key}"),
+        ]])
+    )
+
+@dp.callback_query(F.data.startswith("ty_"))
+async def edit_delete_do(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer()
+        return
+    key = callback_query.data.split("_", 1)[1]
+    if key not in PRODUCTS:
+        await callback_query.answer("Muzqaymoq topilmadi.", show_alert=True)
+        return
+    name = PRODUCTS[key]["name"]
+    if key in products_state["custom"]:
+        del products_state["custom"][key]          # admin qo'shgani: butunlay o'chadi
+        products_state["edits"].pop(key, None)
+    elif key not in products_state["deleted"]:
+        products_state["deleted"].append(key)      # asl ro'yxatdagisi: yashiriladi (qaytarish mumkin)
+    if key in products_state["out"]:
+        products_state["out"].remove(key)
+    products_state["waiting"].pop(key, None)
+    apply_products_state()
+    save_products()
+    await callback_query.answer("O'chirildi 🗑")
+    await _edit_msg(callback_query, f"🗑 <b>{html.escape(name)}</b> o'chirildi.\n\n" + EDIT_LIST_TEXT, edit_list_keyboard())
+
+@dp.callback_query(F.data == "tdl")
+async def edit_deleted_list(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer()
+        return
+    rows = [[InlineKeyboardButton(text=f"♻️ {BASE_PRODUCTS[k]['name']}", callback_data=f"tr_{k}")]
+            for k in products_state["deleted"] if k in BASE_PRODUCTS]
+    rows.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="tback")])
+    await callback_query.answer()
+    await _edit_msg(callback_query, "♻️ Qaytarmoqchi bo'lgan muzqaymoqni tanlang:", InlineKeyboardMarkup(inline_keyboard=rows))
+
+@dp.callback_query(F.data.startswith("tr_"))
+async def edit_restore(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer()
+        return
+    key = callback_query.data.split("_", 1)[1]
+    if key in products_state["deleted"]:
+        products_state["deleted"].remove(key)
+        apply_products_state()
+        save_products()
+    await callback_query.answer("Qaytarildi ♻️")
+    await _edit_msg(callback_query, EDIT_LIST_TEXT, edit_list_keyboard())
+
 # ---------- /start и сценарий ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -1093,6 +1522,27 @@ async def handle_web_app_data(message: types.Message):
         pass
 
     items_list = data_json.get("items", [])
+
+    # Mini App'da tanlangan muzqaymoq tugagan bo'lsa (nomi bo'yicha tekshiramiz), buyurtma qabul qilinmaydi
+    if isinstance(items_list, list):
+        gone = {}
+        for item in items_list:
+            if not isinstance(item, dict):
+                continue
+            t = re.sub(r"^\s*\d+\s*[.)\-]\s*", "", str(item.get("name", ""))).strip().lower()
+            for k, p in PRODUCTS.items():
+                if p["name"].strip().lower() == t and not is_in_stock(k):
+                    gone[k] = p["name"]
+        if gone:
+            for k in gone:
+                add_waiting(k, user_id)
+            await message.answer(
+                "😔 Quyidagi muzqaymoq(lar) hozircha tugagan: <b>" + html.escape(", ".join(gone.values())) + "</b>\n"
+                "Ularsiz buyurtmani qaytadan yuboring. Agar yetib kelsa, sizga xabar yuboramiz 🔔",
+                parse_mode="HTML", reply_markup=main_menu_keyboard
+            )
+            return
+
     total_price = 0
     order_details = ""
     items_summary = []
@@ -1146,7 +1596,7 @@ async def handle_web_app_data(message: types.Message):
 
 # ---------- Каталог ----------
 async def show_catalog(message: types.Message):
-    for key, prod in PRODUCTS.items():
+    for key, prod in list(PRODUCTS.items()):
         box_total = prod['count_in_box'] * prod['price']
         text = (
             f"<b>{prod['name']}</b>\n"
@@ -1154,11 +1604,15 @@ async def show_catalog(message: types.Message):
             f"💰 Dona narxi: {prod['price']} so'm\n"
             f"💵 Jami quti narxi: {box_total} so'm"
         )
+        if not is_in_stock(key):
+            text += "\n\n❌ <b>Hozircha tugagan.</b> Tanlasangiz, yetib kelganda xabar beramiz 🔔"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="📦 Karobkada olish", callback_data=f"box_{key}"),
             InlineKeyboardButton(text="🔢 Dona tanlash", callback_data=f"dona_{key}")
         ]])
         try:
+            if not prod.get('photo'):
+                raise ValueError("rasm yo'q")
             await message.answer_photo(photo=prod['photo'], caption=text, parse_mode="HTML", reply_markup=keyboard)
         except Exception:
             await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
@@ -1167,6 +1621,12 @@ async def show_catalog(message: types.Message):
 async def add_box_to_cart(callback_query: types.CallbackQuery):
     product_key = callback_query.data.split('_', 1)[1]
     user_id = callback_query.from_user.id
+    if product_key not in PRODUCTS:
+        await callback_query.answer("Bu muzqaymoq endi sotuvda yo'q.", show_alert=True)
+        return
+    if not is_in_stock(product_key):
+        await reply_out_of_stock(callback_query, product_key)
+        return
     user_carts.setdefault(user_id, {})
     add_count = PRODUCTS[product_key]['count_in_box']
     user_carts[user_id][product_key] = user_carts[user_id].get(product_key, 0) + add_count
@@ -1175,6 +1635,12 @@ async def add_box_to_cart(callback_query: types.CallbackQuery):
 @dp.callback_query(F.data.startswith('dona_'), OrderState.shopping)
 async def ask_custom_dona(callback_query: types.CallbackQuery, state: FSMContext):
     product_key = callback_query.data.split('_', 1)[1]
+    if product_key not in PRODUCTS:
+        await callback_query.answer("Bu muzqaymoq endi sotuvda yo'q.", show_alert=True)
+        return
+    if not is_in_stock(product_key):
+        await reply_out_of_stock(callback_query, product_key)
+        return
     prod = PRODUCTS[product_key]
     await state.update_data(selected_product=product_key)
     await callback_query.message.answer(
@@ -1193,6 +1659,15 @@ async def process_custom_dona(message: types.Message, state: FSMContext):
     data = await state.get_data()
     product_key = data.get('selected_product')
     user_id = message.from_user.id
+    if product_key not in PRODUCTS:
+        await message.answer("Bu muzqaymoq endi sotuvda yo'q.", reply_markup=main_menu_keyboard)
+        await state.set_state(OrderState.shopping)
+        return
+    if not is_in_stock(product_key):
+        add_waiting(product_key, user_id)
+        await message.answer(out_of_stock_text(product_key), parse_mode="HTML", reply_markup=main_menu_keyboard)
+        await state.set_state(OrderState.shopping)
+        return
     user_carts.setdefault(user_id, {})
     user_carts[user_id][product_key] = user_carts[user_id].get(product_key, 0) + count
     await message.answer(f"Savatga {count} dona qo'shildi! ✅", reply_markup=main_menu_keyboard)
@@ -1243,6 +1718,31 @@ async def finish_order(message: types.Message, state: FSMContext):
     cart = user_carts.get(user_id, {})
     if not cart:
         await message.answer("Savatingiz bo'sh! Avval mahsulot tanlang.", reply_markup=main_menu_keyboard)
+        return
+
+    # Savatga qo'shilgandan keyin tugab qolgan muzqaymoqlarni olib tashlaymiz
+    removed = [k for k in list(cart) if k not in PRODUCTS]
+    if removed:
+        for k in removed:
+            cart.pop(k, None)
+        await message.answer(
+            "😔 Savatingizdagi ba'zi muzqaymoqlar endi sotuvda yo'q va savatdan olib tashlandi.\n"
+            "Savatni tekshirib, buyurtmani qayta yakunlang.",
+            reply_markup=main_menu_keyboard
+        )
+        return
+    gone = [k for k in list(cart) if k in PRODUCTS and not is_in_stock(k)]
+    if gone:
+        for k in gone:
+            cart.pop(k, None)
+            add_waiting(k, user_id)
+        names = ", ".join(html.escape(PRODUCTS[k]['name']) for k in gone)
+        await message.answer(
+            f"😔 Savatingizdagi quyidagi muzqaymoq(lar) tugab qolibdi va savatdan olib tashlandi: <b>{names}</b>\n"
+            "Agar yetib kelsa, sizga xabar yuboramiz 🔔\n\n"
+            "Savatni tekshirib, buyurtmani qayta yakunlang.",
+            parse_mode="HTML", reply_markup=main_menu_keyboard
+        )
         return
 
     data = await state.get_data()
@@ -1559,8 +2059,10 @@ async def process_partial_pay_input(message: types.Message, state: FSMContext):
 async def cmd_backup(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    await _do_backup(delay=0)
-    await message.answer("✅ Zaxira yuborildi va pin qilindi.")
+    await _do_backup(delay=0, force=True)
+    await message.answer(
+        f"✅ Zaxira yuborildi.\n\n👥 Mijozlar: {len(saved_users)}\n📋 Qarzdorlar: {len(debts_db)}\n📦 Buyurtmalar: {len(orders_db)}"
+    )
 
 @dp.message(Command("reset_all"))
 async def cmd_reset_all(message: types.Message):
@@ -1639,6 +2141,9 @@ async def admin_restore_from_file(message: types.Message):
         saved_users.clear(); saved_users.update(data.get("users", {}))
         debts_db.clear(); debts_db.update(data.get("debts", {}))
         orders_db[:] = data.get("orders", [])
+        if "products" in data:
+            load_products_state(data["products"])
+            save_json(PRODUCTS_FILE, products_state)
         save_json(USERS_FILE, saved_users)
         save_json(DEBTS_FILE, debts_db)
         save_json(ORDERS_FILE, orders_db)
@@ -1656,6 +2161,72 @@ async def get_orders_api(request):
 async def get_debts_api(request):
     return web.json_response(debts_db)
 
+def verify_init_data(init_data):
+    """Telegram Mini App initData imzosini tekshiradi; to'g'ri bo'lsa foydalanuvchi ID sini qaytaradi."""
+    try:
+        pairs = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+        got_hash = pairs.pop("hash")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, got_hash):
+            return None
+        return int(json.loads(pairs["user"])["id"])
+    except Exception:
+        return None
+
+async def get_products_api(request):
+    out = {}
+    for k, p in list(PRODUCTS.items()):
+        photo = p.get("photo") or ""
+        is_url = photo.startswith("http")
+        out[k] = {
+            "name": p["name"], "count_in_box": p["count_in_box"], "price": p["price"],
+            "in_stock": is_in_stock(k),
+            "custom": k in products_state["custom"],
+            "edited": list(products_state["edits"].get(k, {}).keys()),
+            "photo": photo if is_url else "",
+            "photo_path": f"/api/photo/{k}?v={hashlib.md5(photo.encode()).hexdigest()[:8]}" if photo and not is_url else "",
+        }
+    return web.json_response(out)
+
+_photo_cache = {}
+
+async def get_photo_api(request):
+    """Telegram'ga yuklangan (file_id) rasmni Mini App ko'rsata olishi uchun."""
+    p = PRODUCTS.get(request.match_info["key"]) or {}
+    fid = p.get("photo") or ""
+    if not fid or fid.startswith("http"):
+        raise web.HTTPNotFound()
+    data = _photo_cache.get(fid)
+    if data is None:
+        try:
+            f = await bot.get_file(fid)
+            buf = io.BytesIO()
+            await bot.download_file(f.file_path, buf)
+            data = buf.getvalue()
+        except Exception:
+            raise web.HTTPNotFound()
+        if len(_photo_cache) > 50:
+            _photo_cache.clear()
+        _photo_cache[fid] = data
+    return web.Response(body=data, content_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+async def post_notify_api(request):
+    """Mini App'da tugagan muzqaymoq uchun «kelsa xabar bering» so'rovi."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "bad_request"}, status=400)
+    uid = verify_init_data(str(body.get("initData", "")))
+    if not uid:
+        return web.json_response({"ok": False, "error": "auth"}, status=403)
+    key = str(body.get("key", ""))
+    if key not in PRODUCTS or is_in_stock(key):
+        return web.json_response({"ok": False, "error": "not_out"})
+    add_waiting(key, uid)
+    return web.json_response({"ok": True})
+
 async def handle_ping(request):
     return web.Response(text="Bot va API ishlamoqda!")
 
@@ -1670,6 +2241,9 @@ async def setup_bot_menu():
                 BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
                 BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati"),
                 BotCommand(command="xabar", description="📣 Hammaga xabar yuborish"),
+                BotCommand(command="yangi", description="➕ Yangi muzqaymoq qo'shish"),
+                BotCommand(command="holat", description="📦 Muzqaymoq bor / tugadi"),
+                BotCommand(command="tahrir", description="✏️ Muzqaymoqni tahrirlash / o'chirish"),
             ], scope=BotCommandScopeChat(chat_id=_adm))
         except Exception as e:
             logging.warning(f"Admin menyusi ({_adm}): {e}")
@@ -1682,6 +2256,9 @@ async def main():
     app.router.add_get("/", handle_ping)
     app.router.add_get("/api/orders", get_orders_api)
     app.router.add_get("/api/debts", get_debts_api)
+    app.router.add_get("/api/products", get_products_api)
+    app.router.add_get("/api/photo/{key}", get_photo_api)
+    app.router.add_post("/api/notify", post_notify_api)
 
     # Настройка CORS
     cors = aiohttp_cors.setup(app, defaults={
