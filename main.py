@@ -44,7 +44,11 @@ WEBAPP_URL = "https://yaypanmuzqaymoq.netlify.app/"
 # Yaypan shahri markazi (mijozlarga xarita sifatida yuboriladi)
 YAYPAN_LAT, YAYPAN_LON = 40.37583, 70.81556
 # Xaritadan joy tanlash sahifasi: geo.html ni shu netlify saytga (index.html yoniga) yuklang
-GEO_PICKER_URL = os.environ.get("GEO_PICKER_URL", WEBAPP_URL.rstrip("/") + "/geo.html") + f"?lat={YAYPAN_LAT}&lon={YAYPAN_LON}"
+# Xarita sahifasi botning o'zidan (/geo) beriladi, shuning uchun Netlify'da geo.html bo'lishi shart emas (404 chiqmaydi).
+# Botning ochiq manzili (Render). Kerak bo'lsa Render'da BOT_PUBLIC_URL yoki GEO_PICKER_URL o'zgaruvchisini bering.
+BOT_PUBLIC_URL = (os.environ.get("BOT_PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "https://yaypan-muzqaymoq.onrender.com").rstrip("/")
+_geo_base = os.environ.get("GEO_PICKER_URL") or (BOT_PUBLIC_URL + "/geo")
+GEO_PICKER_URL = _geo_base + ("&" if "?" in _geo_base else "?") + f"lat={YAYPAN_LAT}&lon={YAYPAN_LON}"
 # Agar Render'da Persistent Disk ulasangiz, DATA_DIR=/data qilib qo'ying
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -1405,6 +1409,9 @@ async def process_name(message: types.Message, state: FSMContext):
 
 @dp.message(OrderState.waiting_for_location)
 async def process_location(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Iltimos, manzilingizni matn ko'rinishida yozib yuboring:")
+        return
     await state.update_data(location=message.text)
     geo_kb = ReplyKeyboardMarkup(
         keyboard=[
@@ -1511,6 +1518,15 @@ async def handle_web_app_data(message: types.Message):
         data_json = json.loads(raw_data)
     except Exception:
         data_json = {}
+
+    # Faqat xaritadan tanlangan nuqta keldi (buyurtma emas), lekin bot holati yo'qolgan (masalan, qayta ishga tushgan)
+    if (isinstance(data_json, dict) and "lat" in data_json and "lon" in data_json
+            and not data_json.get("items") and "totalPrice" not in data_json):
+        await message.answer(
+            "⚠️ Lokatsiya qabul qilinmadi, chunki jarayon uzilib qoldi. Iltimos, /start ni bosib qaytadan boshlang.",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        return
 
     user_saved_info = saved_users.get(str(user_id)) or {}
     user_name = data_json.get("name") or user_saved_info.get("name") or message.from_user.full_name
@@ -2156,6 +2172,144 @@ async def admin_restore_from_file(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Tiklab bo'lmadi: {e}")
 
+GEO_HTML = r'''<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Lokatsiyani belgilash</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  html, body { margin:0; height:100%; font-family:-apple-system,Roboto,Arial,sans-serif; background:#fff; }
+  #map { position:absolute; inset:0; }
+  .pin { position:absolute; left:50%; top:50%; width:0; height:0; z-index:1000; pointer-events:none; }
+  .pin span { position:absolute; left:-18px; top:-44px; font-size:36px; line-height:1; filter:drop-shadow(0 3px 3px rgba(0,0,0,.35)); }
+  .pin i { position:absolute; left:-4px; top:-4px; width:8px; height:8px; border-radius:50%; background:rgba(0,0,0,.35); }
+  .top { position:absolute; z-index:1000; top:10px; left:10px; right:10px; display:flex; gap:8px; }
+  .top input { flex:1; min-width:0; padding:12px 14px; border:0; border-radius:14px; font-size:15px; box-shadow:0 2px 10px rgba(0,0,0,.25); outline:none; }
+  .top button, .fab { border:0; background:#fff; border-radius:14px; width:46px; font-size:20px; box-shadow:0 2px 10px rgba(0,0,0,.25); cursor:pointer; }
+  .fabs { position:absolute; z-index:1000; right:10px; bottom:110px; display:flex; flex-direction:column; gap:8px; }
+  .fab { height:46px; }
+  .bottom { position:absolute; z-index:1000; left:10px; right:10px; bottom:calc(10px + env(safe-area-inset-bottom,0px)); }
+  #ok { width:100%; padding:15px; border:0; border-radius:16px; background:linear-gradient(90deg,#6366f1,#a855f7); color:#fff; font-size:17px; font-weight:700; box-shadow:0 4px 14px rgba(0,0,0,.3); cursor:pointer; }
+  #addr { background:#fff; border-radius:12px; padding:8px 12px; margin-bottom:8px; font-size:13px; color:#333; box-shadow:0 2px 10px rgba(0,0,0,.2); display:none; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="pin"><span>📍</span><i></i></div>
+<form class="top" id="sform"><input id="q" placeholder="Manzil qidirish..." autocomplete="off"><button type="submit">🔍</button></form>
+<div class="fabs">
+  <button class="fab" id="sat" type="button" title="Sputnik">🛰</button>
+  <button class="fab" id="me" type="button" title="Mening joyim">🎯</button>
+</div>
+<div class="bottom"><div id="addr"></div><button id="ok" type="button">✅ Tasdiqlash</button></div>
+<script>
+(function () {
+  // Google Maps API kalitini shu yerga qo'ying. Bo'sh qolsa oddiy (OpenStreetMap) xarita ochiladi.
+  var GOOGLE_KEY = "";
+
+  var tg = window.Telegram && Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+  var p = new URLSearchParams(location.search);
+  var lat = parseFloat(p.get('lat')), lon = parseFloat(p.get('lon'));
+  if (!isFinite(lat) || !isFinite(lon)) { lat = 40.37583; lon = 70.81556; }
+
+  var M = null; // {getCenter, setCenter, toggleSat, onIdle}
+  var addr = document.getElementById('addr'), t;
+
+  function initLeaflet() {
+    document.getElementById('map').innerHTML = '';
+    var map = L.map('map', { zoomControl:false, maxZoom:21 }).setView([lat, lon], 17);
+    var street = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxNativeZoom:19, maxZoom:21, referrerPolicy:'origin', attribution:'© OpenStreetMap' });
+    var sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom:18, maxZoom:21, attribution:'Esri' });
+    var lbl = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', { maxNativeZoom:18, maxZoom:21 });
+    var isSat = false; street.addTo(map);
+    M = {
+      getCenter: function () { var c = map.getCenter(); return { lat:c.lat, lon:c.lng }; },
+      setCenter: function (la, lo, z) { map.setView([la, lo], z || 18); },
+      toggleSat: function () { if (isSat) { map.removeLayer(sat); map.removeLayer(lbl); street.addTo(map); } else { map.removeLayer(street); sat.addTo(map); lbl.addTo(map); } isSat = !isSat; },
+      onIdle: function (f) { map.on('moveend', f); },
+      search: function (q, cb) {
+        fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=uz&q=' + encodeURIComponent(q))
+          .then(function (r) { return r.json(); }).then(function (a) { cb(a[0] ? { lat:+a[0].lat, lon:+a[0].lon } : null); })
+          .catch(function () { cb(null); });
+      }
+    };
+    M.onIdle(updateAddr); updateAddr();
+  }
+
+  function initGoogle() {
+    var gm = new google.maps.Map(document.getElementById('map'), {
+      center: { lat:lat, lng:lon }, zoom: 18, mapTypeId: 'roadmap',
+      disableDefaultUI: true, zoomControl: true, gestureHandling: 'greedy', clickableIcons: false, keyboardShortcuts: false
+    });
+    var geocoder = new google.maps.Geocoder(), sat = false;
+    M = {
+      getCenter: function () { var c = gm.getCenter(); return { lat:c.lat(), lon:c.lng() }; },
+      setCenter: function (la, lo, z) { gm.setCenter({ lat:la, lng:lo }); gm.setZoom(z || 18); },
+      toggleSat: function () { sat = !sat; gm.setMapTypeId(sat ? 'hybrid' : 'roadmap'); },
+      onIdle: function (f) { gm.addListener('idle', f); },
+      search: function (q, cb) {
+        geocoder.geocode({ address: q, region: 'uz' }, function (res, st) {
+          if (st === 'OK' && res[0]) { var l = res[0].geometry.location; cb({ lat:l.lat(), lon:l.lng() }); } else cb(null);
+        });
+      },
+      geocoder: geocoder
+    };
+    M.onIdle(updateAddr); updateAddr();
+  }
+
+  function updateAddr() {
+    clearTimeout(t);
+    t = setTimeout(function () {
+      var c = M.getCenter();
+      fetch('https://nominatim.openstreetmap.org/reverse?format=json&zoom=18&accept-language=uz,ru&lat=' + c.lat + '&lon=' + c.lon)
+        .then(function (r) { return r.json(); })
+        .then(function (d) { if (d && d.display_name) { addr.textContent = d.display_name; addr.style.display = 'block'; } })
+        .catch(function () {});
+    }, 500);
+  }
+
+  window.gm_authFailure = function () { initLeaflet(); };
+  if (GOOGLE_KEY) {
+    window.__gmInit = initGoogle;
+    var sc = document.createElement('script');
+    sc.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(GOOGLE_KEY) + '&language=uz&region=UZ&callback=__gmInit';
+    sc.onerror = initLeaflet;
+    document.head.appendChild(sc);
+  } else initLeaflet();
+
+  document.getElementById('sat').onclick = function () { if (M) M.toggleSat(); };
+  document.getElementById('me').onclick = function () {
+    if (!navigator.geolocation || !M) return;
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      M.setCenter(pos.coords.latitude, pos.coords.longitude, 18);
+    }, function () { alert("Joylashuvni aniqlab bo'lmadi. Xaritani surib belgilang."); }, { enableHighAccuracy:true, timeout:10000 });
+  };
+  document.getElementById('sform').onsubmit = function (e) {
+    e.preventDefault();
+    var q = document.getElementById('q').value.trim(); if (!q || !M) return;
+    M.search(q, function (r) { if (r) M.setCenter(r.lat, r.lon, 18); else alert('Topilmadi'); });
+  };
+  document.getElementById('ok').onclick = function () {
+    if (!M) return;
+    var c = M.getCenter();
+    var data = JSON.stringify({ lat: +c.lat.toFixed(6), lon: +c.lon.toFixed(6) });
+    if (tg && tg.platform && tg.platform !== 'unknown') { tg.sendData(data); }
+    else alert("Tasdiqlash faqat Telegram bot ichida ishlaydi. Botdagi «📍 Lokatsiyani belgilash» tugmasi orqali oching.\n\nTanlangan nuqta: " + data);
+  };
+})();
+</script>
+</body>
+</html>
+'''
+
+async def get_geo_page(request):
+    return web.Response(text=GEO_HTML, content_type="text/html", charset="utf-8", headers={"Cache-Control": "no-cache"})
+
 # ---------- API (Для мобильного приложения) ----------
 async def get_orders_api(request):
     return web.json_response(orders_db)
@@ -2260,6 +2414,8 @@ async def main():
     
     # Маршруты HTTP
     app.router.add_get("/", handle_ping)
+    app.router.add_get("/geo", get_geo_page)
+    app.router.add_get("/geo.html", get_geo_page)
     app.router.add_get("/api/orders", get_orders_api)
     app.router.add_get("/api/debts", get_debts_api)
     app.router.add_get("/api/products", get_products_api)
