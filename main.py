@@ -2233,7 +2233,6 @@ async def handle_ping(request):
 async def setup_bot_menu():
     await bot.set_my_commands([
         BotCommand(command="start", description="🍦 Buyurtma berishni boshlash"),
-        BotCommand(command="debts", description="📋 Qarzdorlar ro'yxati (Admin)"),
     ])
     for _adm in ADMIN_IDS:
         try:
