@@ -25,7 +25,7 @@ BASE_UID = 7_000_000_000
 
 # ---------------- Xavfsiz muhit (import'dan OLDIN) ----------------
 TMP = tempfile.mkdtemp(prefix="stress_")
-os.environ["BOT_TOKEN"] = "123456:ABCDEFghijklmnopqrstuvwxyz0123456789"
+os.environ["BOT_TOKEN"] = "8941827736:AAFyvn1eOUJJm5GmTx3Fv19cLahM30rA_iI"
 os.environ["DATA_DIR"] = TMP
 test_db = os.environ.get("TEST_DATABASE_URL", "").strip()
 if test_db:
