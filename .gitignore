@@ -3,8 +3,6 @@ debts.json
 orders.json
 subscribers.json
 backup.json
-clock.json
-premium_emoji.json
 __pycache__/
 *.pyc
 .env
