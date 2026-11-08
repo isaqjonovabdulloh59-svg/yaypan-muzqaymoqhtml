@@ -1,4 +1,4 @@
-aiogram>=3.21
+aiogram>=3.0
 aiohttp
 aiohttp-cors
 Pillow
